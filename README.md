@@ -8,7 +8,7 @@ Tài liệu hướng dẫn toàn diện về kiến trúc, cơ chế hoạt đ�
 1. [Tổng Quan Hệ Thống](#1-tổng-quan-hệ-thống)
 2. [Cấu Trúc Thư Mục & Các Tệp Tin Quan Trọng](#2-cấu-trúc-thư-mục--các-tệp-tin-quan-trọng)
 3. [Cơ Chế Cache Của Tool Gốc Unity và Web Tool](#3-cơ-chế-cache-của-tool-gốc-unity-và-web-tool)
-   - [3.1. Cache Gốc Unity (Alchera ADO Tool)](#31-cache-gốc-unity-alchera-ado-tool)
+   - [3.1. Cache Gốc Unity ](#31-cache-gốc-unity-tool)
    - [3.2. Cache Web Tool (Local Cache H:\a\cache)](#32-cache-web-tool-local-cache-hacache)
    - [3.3. Quy Tắc Bất Biến Khi Đọc & Ghi Cache](#33-quy-tắc-bất-biến-khi-đọc--ghi-cache)
 4. [Hướng Dẫn Sao Lưu (Backup) & Phục Hồi Dữ Liệu](#4-hướng-dẫn-sao-lưu-backup--phục-hồi-dữ-liệu)
@@ -28,7 +28,7 @@ Tài liệu hướng dẫn toàn diện về kiến trúc, cơ chế hoạt đ�
 ## 1. Tổng Quan Hệ Thống
 
 Dự án này là bộ công cụ gán nhãn dữ liệu xe tự hành (Autonomous Driving Object Detection - ADO 3D) kết hợp giữa:
-1. **Tool Gốc Unity (`ADO-anntoation-tool`)**: Ứng dụng chạy trên nền Unity của hãng Alchera Inc, dùng để load chuỗi dữ liệu (Sequence) từ server công ty về máy cục bộ.
+1. **Tool Gốc Unity (`ADO-anntoation-tool`)**: Ứng dụng chạy trên nền Unity của hãng  Inc, dùng để load chuỗi dữ liệu (Sequence) từ server công ty về máy cục bộ.
 2. **Tool Web Nội Bộ (`Web Annotation Tool`)**: Ứng dụng web chạy trên nền Python Flask (`localhost:5000`) và Three.js / Canvas HTML5. Công cụ này được xây dựng để khắc phục các hạn chế của Unity (nhanh hơn, nhẹ hơn, có tính năng Auto Box nội suy quỹ đạo, chỉnh sửa 2D/3D đồng thời, và sao lưu dữ liệu lên Google Drive).
 3. **Công cụ Kiểm Tra Nhanh (`FastCheck App`)**: Ứng dụng phụ chạy tại `localhost:5050` dùng để review nhanh dữ liệu 10 frame cùng lúc ở chế độ Read-Only.
 
@@ -68,9 +68,9 @@ H:\a\
 
 ## 3. Cơ Chế Cache Của Tool Gốc Unity và Web Tool
 
-### 3.1. Cache Gốc Unity (Alchera ADO Tool)
+### 3.1. Cache Gốc Unity 
 * **Đường dẫn thư mục**:
-  `C:\Users\Administrator\AppData\LocalLow\Alchera Inc\ADO-anntoation-tool\sequence`
+  `C:\Users\Administrator\AppData\LocalLow\...\sequence`
 * **Quy chuẩn 31 File**:
   Một sequence đầy đủ gồm đúng **31 file**:
   * 10 file Point Cloud PCD: `0000_MCAM_....pcd` đến `0009_MCAM_....pcd`
@@ -113,7 +113,7 @@ H:\a\
 
 ### 4.1. Sao Lưu Cache Gốc Unity
 * Khi tool Unity tải xong một sequence mới, copy toàn bộ thư mục:
-  `C:\Users\Administrator\AppData\LocalLow\Alchera Inc\ADO-anntoation-tool\sequence`
+  `C:\Users\Administrator\AppData\LocalLow\...\sequence`
   sang một nơi an toàn hoặc nén thành file `.zip`.
 
 ### 4.2. Sao Lưu Cache Web Cục Bộ
