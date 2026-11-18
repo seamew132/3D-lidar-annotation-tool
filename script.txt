@@ -1,0 +1,4725 @@
+// ==UserScript==
+// @name         ALCHERA ADO - PJT64 Fast Class & Subclass Toolbar, English UI & Auto ROI
+// @namespace    https://ado.treed.ai/
+// @version      5.0.0
+// @description  Fast 3D Cuboid annotation toolbar with hover Subclass Flyout, Subclass Guideline Hover Overlay, Direct Google Slide Guideline button, real React state mutation, direct hotkeys (1-9, 0), Top Active Class Badge, Always-ON Height(Z) Filter, Save Temp T/O button, Paste Temp T/O button, Smart L Key with T/O confirmation, Viewmode 2D camera box detection with glowing border and manual toggles (Hotkey ~), Floating Quick T/O Editor (Middle-click or Comma ,), Edge Truncation Warning, persistent localStorage caching, Vietnamese Shortcut Guide modal, English UI translation, and auto ROI preset.
+// @author       Antigravity
+// @match        https://ado.treed.ai/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // =========================================================================
+  // 0. WEBGL SHADER POINT CLOUD HOOK (TURBO COLORMAP + AUTO Z-RANGE + ATTENUATION)
+  // =========================================================================
+  function enhanceLidarShader(source) {
+    if (typeof source !== 'string' || !source.includes('vec3 jet(float t)')) {
+      return source;
+    }
+
+    console.log('[ADO Userscript] Intercepted LiDAR WebGL Shader! Injecting Turbo Colormap & Size Attenuation...');
+
+    // 1. Replace jet(t) with high-contrast Turbo Colormap function
+    const turboShaderCode = `
+// Turbo colormap approximation by Google (Smooth, high contrast, perceptual depth)
+vec3 turboColormap(float x) {
+  const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+  const vec4 kGreenVec4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+  const vec4 kBlueVec4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+  const vec2 kRedVec2 = vec2(-152.94239396, 59.28637943);
+  const vec2 kGreenVec2 = vec2(4.27729857, 2.82956604);
+  const vec2 kBlueVec2 = vec2(-89.90310912, 27.34824973);
+  x = clamp(x, 0.0, 1.0);
+  vec4 v4 = vec4(1.0, x, x * x, x * x * x);
+  vec2 v2 = v4.zw * v4.z;
+  return clamp(vec3(
+    dot(v4, kRedVec4) + dot(v2, kRedVec2),
+    dot(v4, kGreenVec4) + dot(v2, kGreenVec2),
+    dot(v4, kBlueVec4) + dot(v2, kBlueVec2)
+  ), 0.0, 1.0);
+}
+
+vec3 jet(float t) {
+  return turboColormap(t);
+}
+`;
+
+    let modified = source.replace(/vec3\s+jet\s*\(\s*float\s+t\s*\)\s*\{[\s\S]*?return\s+clamp\([\s\S]*?\);\s*\}/, turboShaderCode);
+
+    // 2. Enhance height mapping: Focus effective Z range [-2.2m, 2.8m] for vivid contrast
+    modified = modified.replace(
+      /float\s+t\s*=\s*uHeightColor\s*>\s*0\.5[\s\S]*?clamp\(\(intensity\s*-\s*uMin\)[\s\S]*?\);/,
+      `// High-contrast height gradient: Ground [-2.0m] (navy/cyan) -> Body [0.0m] (green/yellow) -> Roof [+2.0m] (red/orange)
+  float effectiveZ = clamp((position.z - (-2.2)) / 4.6 * uMul, 0.0, 1.0);
+  float t = uHeightColor > 0.5 ? effectiveZ : clamp((intensity - uMin) / max(uMax - uMin, 1e-6) * uMul, 0.0, 1.0);`
+    );
+
+    // 3. Crisp Point Size: LiDAR phụ (Ortho section view) siêu sắc nét (nhỏ gọn 1.0-1.5px, hết nhòe)
+    // LiDAR chính: sắc nét theo uSize, không bị phóng to phồng điểm khi zoom gần
+    modified = modified.replace(
+      /gl_PointSize\s*=\s*uSize\s*;/,
+      `// High-clarity point size: crisp & delicate in ortho sub-views (LiDAR phu), sharp in perspective
+  bool isOrtho = (projectionMatrix[3][3] > 0.5);
+  if (isOrtho) {
+    gl_PointSize = clamp(uSize * 0.6, 1.0, 1.5);
+  } else {
+    float distCam = max(-mvPosition.z, 6.0);
+    gl_PointSize = clamp(uSize * (6.0 / distCam), 1.0, 2.0);
+  }`
+    );
+
+    return modified;
+  }
+
+  // Hook WebGL shaderSource on prototypes
+  try {
+    if (typeof WebGLRenderingContext !== 'undefined') {
+      const origShaderSource = WebGLRenderingContext.prototype.shaderSource;
+      WebGLRenderingContext.prototype.shaderSource = function(shader, source) {
+        return origShaderSource.call(this, shader, enhanceLidarShader(source));
+      };
+    }
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+      const origShaderSource2 = WebGL2RenderingContext.prototype.shaderSource;
+      WebGL2RenderingContext.prototype.shaderSource = function(shader, source) {
+        return origShaderSource2.call(this, shader, enhanceLidarShader(source));
+      };
+    }
+    console.log('[ADO Userscript] WebGL Shader Hook successfully registered.');
+  } catch (err) {
+    console.warn('[ADO Userscript] Failed to hook WebGL shaderSource:', err);
+  }
+
+  // =========================================================================
+  // 1. PJT64 CATEGORIES & SUBCLASSES (WITH DIRECT DIMENSION HOTKEYS 1-9, 0)
+  // =========================================================================
+
+  const PJT64_CLASSES = [
+    {
+      category: "VEHICLE",
+      label: "🚗 Vehicle",
+      title: "VEHICLE (Phương tiện giao thông)",
+      subclasses: [
+        {
+          name: "sedan",
+          title: "Sedan",
+          desc: "Xe ô tô (Sedan, hatchback...). Cao tối đa ~1.5m",
+          refSize: "1.8 x 1.5 x 4.3",
+          key: "1",
+          guideDetail: "Xe ô tô thấp (Sedan, hatchback...). Thân xe cao tối đa ~1.5m, thiết kế khí động học mềm mại, chia 3 khoang riêng biệt (động cơ, hành khách, hành lý), bánh xe thon gọn.",
+          guideRules: "• <b>Bao gồm:</b> Vật chở theo (hành lý nóc, đèn taxi...), ăng-ten vây cá mập.<br>• <b>KHÔNG gồm:</b> Gương chiếu hậu, ăng-ten que dài."
+        },
+        {
+          name: "suv",
+          title: "SUV",
+          desc: "Xe thể thao đa dụng (Tucson, Santa Fe, Sorento...). Cao tối thiểu ~1.55m",
+          refSize: "1.9 x 1.6 x 4.7",
+          key: "2",
+          guideDetail: "Xe thể thao đa dụng (Tucson, Santa Fe, Sorento...) + gồm cả CUV, EV6. Thân xe to, thẳng vuông vức, cao tối thiểu ~1.55m. Cấu trúc 2 phần (khoang máy + khoang khách liền cốp sau). Lốp to dày, có nẹp nhựa (plastic molding) quanh vòm bánh, có giá nóc.",
+          guideRules: "• <b>Phân biệt với Sedan:</b> Thân cao hơn (trên 1.55m), thiết kế góc cạnh, lốp to dày, có giá nóc và nẹp nhựa."
+        },
+        {
+          name: "compact",
+          title: "Compact",
+          desc: "Xe cỡ nhỏ (Morning, Ray, Spark, Casper, i30... W<1.6m, L<3.6m)",
+          refSize: "1.6 x 1.5 x 3.6",
+          guideDetail: "Xe tương đối nhỏ, hatchback (dòng xe nhỏ hơn hoặc bằng Kia Ray, Casper EV, Morning, Spark, i30, K4 hatchback, Pride, Soul Booster, Mini Cooper, Clubman).",
+          guideRules: "• <b>Kích thước thực tế:</b> Rộng < 1.6m, Cao < 2.0m, Dài < 3.6m.<br>• <i>Lưu ý:</i> Dựa trên kích thước thực tế, trên PCD có thể trông lớn hơn do nhiễu."
+        },
+        {
+          name: "van",
+          title: "Van",
+          desc: "Xe hộp dài (Staria, Starex, Carnival, Solati...). Tay nắm cửa sau ở phía trước",
+          refSize: "1.9 x 1.9 x 4.4",
+          key: "5",
+          guideDetail: "Xe dạng hộp dài (Staria, Starex, Solati, Benz Sprinter, Kia Carnival, van chở hàng, camper van). Thân xe cao, mái cao (nhiều mẫu trên 2m).",
+          guideRules: "• <b>Đặc điểm nhận biết then chốt:</b> Tay nắm cửa sau nằm ở <u>phía trước</u> (trong khi SUV tay nắm cửa sau bố trí ở <u>phía sau</u>)!"
+        },
+        {
+          name: "truck",
+          title: "Truck",
+          desc: "Xe tải, xe bán tải (có khoang chở hàng riêng biệt)",
+          refSize: "2.0 x 2.4 x 5.0",
+          key: "4",
+          guideDetail: "Xe tải chở hàng, xe thùng kín và cả xe bán tải (pickup). Khoang chở hàng phía sau được mở hoặc có thùng hàng phân tách rõ ràng với khoang lái.",
+          guideRules: "• Bao gồm toàn bộ thùng chở hàng và hàng hóa trên thùng.<br>• KHÔNG gom gương chiếu hậu vào cuboid."
+        },
+        {
+          name: "bus",
+          title: "BUS",
+          desc: "Xe buýt, minibus, school bus (W: 2~3m, H: 2.5~4m)",
+          refSize: "2.2 x 2.8 x 9.0",
+          key: "3",
+          guideDetail: "Xe buýt công cộng, minibus, xe đưa đón học sinh (Rộng: 2~3m, Cao: 2.5~4m, Dài: 8~12m).",
+          guideRules: "• Nếu PCD bị khuất, dùng kích thước Reference 2.2 x 2.8 x 9.0m rồi căn chỉnh khớp phần nhìn thấy."
+        },
+        {
+          name: "special",
+          title: "Special",
+          desc: "Xe cứu hộ, cứu hỏa, xe kiểm soát giao thông...",
+          refSize: "2.0 x 2.4 x 5.5",
+          guideDetail: "Xe chuyên dụng đặc biệt: xe cứu hỏa, xe cứu hộ cứu nạn, xe kiểm soát giao thông đường bộ...",
+          guideRules: "• Gán nhãn bao gồm cả đèn ưu tiên trên nóc và thiết bị chuyên dụng gắn liền với xe."
+        },
+        {
+          name: "unknown_vehicle",
+          title: "Unknown",
+          desc: "Caravan, trailer, xe khác...",
+          guideDetail: "Phương tiện giao thông không được định nghĩa trong các subclass trên (như caravan, trailer / rơ-moóc kéo rời...).",
+          guideWarning: "Nếu không chắc chắn về việc phân loại, vui lòng hỏi PM/Leader để xác nhận."
+        }
+      ]
+    },
+    {
+      category: "PERSON",
+      label: "🚶 Person",
+      title: "PERSON (Người & Hành khách)",
+      subclasses: [
+        {
+          name: "adult_pedestrian",
+          title: "Adult Pedestrian",
+          desc: "Người đi bộ trưởng thành (không gồm ô/dù, túi xách)",
+          refSize: "0.6 x 1.75 x 0.6",
+          guideDetail: "Người đi bộ trưởng thành đang đứng hoặc di chuyển bằng chân.",
+          guideRules: "• <b>Quy tắc quan trọng:</b> KHÔNG gán nhãn gom các vật dụng cá nhân của Person như ô (dù), túi xách..."
+        },
+        {
+          name: "child_pedestrian",
+          title: "Child Pedestrian",
+          desc: "Người đi bộ trẻ em",
+          refSize: "0.5 x 1.2 x 0.5",
+          guideDetail: "Người đi bộ trẻ em (thường có chiều cao thấp hơn hẳn người lớn, tầm ~1.2m).",
+          guideRules: "• KHÔNG gán gom cặp sách, ba lô, ô dù cầm tay của trẻ em."
+        },
+        {
+          name: "motorcycle_rider",
+          title: "Motorcycle Rider",
+          desc: "Người điều khiển xe máy / scooter (tách riêng xe)",
+          refSize: "0.7 x 1.4 x 0.8",
+          guideDetail: "Người đang ngồi điều khiển xe máy, xe scooter.",
+          guideRules: "• <b>Bắt buộc:</b> TÁCH RIÊNG phương tiện di chuyển và người lái thành 2 cuboid độc lập!<br>• Cuboid người rider KHÔNG bao gồm xe máy."
+        },
+        {
+          name: "bicycle_rider",
+          title: "Bicycle Rider",
+          desc: "Người điều khiển xe đạp (tách riêng xe)",
+          refSize: "0.6 x 1.4 x 0.8",
+          guideDetail: "Người đang ngồi điều khiển xe đạp.",
+          guideRules: "• <b>Bắt buộc:</b> TÁCH RIÊNG người điều khiển và xe đạp thành 2 cuboid riêng biệt."
+        },
+        {
+          name: "mobility_rider",
+          title: "Mobility Rider",
+          desc: "Người đi xe scooter điện, xe lăn (tách riêng xe)",
+          refSize: "0.7 x 1.3 x 0.8",
+          guideDetail: "Người sử dụng xe scooter điện, người ngồi trên xe lăn.",
+          guideRules: "• <b>Bắt buộc:</b> TÁCH RIÊNG người và thiết bị mobility (xe scooter / xe lăn)."
+        },
+        {
+          name: "unknown_person",
+          title: "Unknown Person",
+          desc: "Người đang ngồi hoặc nằm (không thể đi bộ)",
+          guideDetail: "Bao gồm những người đang ngồi bệt dưới đất, ngồi ghế ngoài vỉa hè hoặc đang nằm (trong trạng thái không thể đi bộ).",
+          guideWarning: "Người đang ngồi hoặc nằm chọn unknown_person (KHÔNG chọn pedestrian)."
+        },
+        {
+          name: "unknown_rider",
+          title: "Unknown Rider",
+          desc: "Hành khách khác...",
+          guideDetail: "Các đối tượng hành khách không được định nghĩa trong subclass rider ở trên.",
+          guideWarning: "Trừ các trường hợp có từ 2 người trở lên ngồi trên xe thì không làm."
+        }
+      ]
+    },
+    {
+      category: "CYCLE",
+      label: "🚲 Cycle",
+      title: "CYCLE (Xe hai bánh)",
+      subclasses: [
+        {
+          name: "motorcycle",
+          title: "Motorcycle",
+          desc: "Xe máy, scooter (không bao gồm người lái)",
+          refSize: "0.7 x 1.1 x 1.9",
+          key: "6",
+          guideDetail: "Xe máy, xe scooter, xe tay ga, mô tô.",
+          guideRules: "• <b>Phạm vi:</b> Gồm gương chiếu hậu, kính chắn gió trước, tay lái và thùng chở hàng phía sau.<br>• <b>Tuyệt đối:</b> KHÔNG bao gồm người lái khi gán nhãn xe máy."
+        },
+        {
+          name: "bicycle",
+          title: "Bicycle",
+          desc: "Xe đạp (không bao gồm người lái)",
+          refSize: "0.7 x 1.0 x 1.7",
+          key: "7",
+          guideDetail: "Xe đạp các loại (xe đạp thể thao, xe đạp mini, xe cào cào...).",
+          guideRules: "• Bao gồm trọn vẹn khung xe, hai bánh xe, ghi đông và bàn đạp.<br>• KHÔNG bao gồm người lái."
+        },
+        {
+          name: "unknown_cycle",
+          title: "Unknown Cycle",
+          desc: "Phương tiện cycle khác...",
+          guideDetail: "Các đối tượng phương tiện cycle không thuộc xe máy hay xe đạp (xe đạp đôi, xe ba bánh tự chế...).",
+          guideRules: "• Labeling KHÔNG bao gồm người lái xe."
+        }
+      ]
+    },
+    {
+      category: "MOBILITY",
+      label: "🛴 Mobility",
+      title: "MOBILITY (Thiết bị di chuyển cá nhân)",
+      subclasses: [
+        {
+          name: "kick_scooter",
+          title: "Kick Scooter",
+          desc: "Xe scooter điện không người điều khiển",
+          refSize: "0.4 x 1.1 x 1.1",
+          guideDetail: "Xe scooter điện đứng một mình, không có người điều khiển.",
+          guideRules: "• Nếu có người đang lái, người lái phải gán riêng thành mobility_rider."
+        },
+        {
+          name: "wheelchair",
+          title: "Wheelchair",
+          desc: "Xe lăn không người",
+          refSize: "0.7 x 0.9 x 1.0",
+          guideDetail: "Xe lăn không có người ngồi.",
+          guideWarning: "Người ngồi trên xe lăn không thuộc phạm vi gán cuboid của wheelchair (phải tách riêng thành mobility_rider)."
+        },
+        {
+          name: "unknown_mobility",
+          title: "Unknown Mobility",
+          desc: "Mobility khác không người...",
+          guideDetail: "Các đối tượng MOBILITY khác không có người điều khiển.",
+          guideWarning: "Người ngồi trên phương tiện không thuộc phạm vi gán cuboid này."
+        }
+      ]
+    },
+    {
+      category: "CART",
+      label: "🛒 Cart",
+      title: "CART (Xe đẩy hàng / Siêu thị)",
+      subclasses: [
+        {
+          name: "shopping_single",
+          title: "Shopping Single",
+          desc: "Xe đẩy mua sắm 1 cái",
+          refSize: "0.6 x 1.0 x 1.0",
+          key: "8",
+          guideDetail: "Xe đẩy mua sắm siêu thị đứng đơn lẻ (đúng 1 cái). Kích thước W: 0.6~1.0, H: 0.9~1.4, L: 0.9~1.5m.",
+          guideRules: "• Gán sát khung xe đẩy, không gom người đẩy vào trong cuboid."
+        },
+        {
+          name: "shopping_stacked",
+          title: "Shopping Stacked",
+          desc: "Xe đẩy mua sắm lồng nhau từ 2 cái trở lên",
+          refSize: "0.6 x 1.0 x 2.0",
+          guideDetail: "Xe đẩy mua sắm xếp lồng nhau từ 2 cái trở lên thành một cụm hoặc một hàng dài. Kích thước L: 1.2~5.0m.",
+          guideRules: "• Gán nhãn toàn bộ chuỗi các xe đẩy lồng nhau vào chung 1 khối cuboid."
+        },
+        {
+          name: "unknown_cart",
+          title: "Unknown Cart",
+          desc: "Loại xe đẩy khác...",
+          refSize: "0.7 x 1.0 x 1.0",
+          guideDetail: "Các loại xe đẩy hàng hóa, xe kéo tay khác trong bãi đỗ hoặc trung tâm thương mại. Kích thước W: 0.3~1.8, H: 0.3~1.5, L: 0.3~2.2m."
+        }
+      ]
+    },
+    {
+      category: "PARKING_OBSTACLE",
+      label: "🚧 Parking",
+      title: "PARKING_OBSTACLE (Chướng ngại vật bãi đỗ - 17 Subclasses chuẩn)",
+      subclasses: [
+        {
+          name: "stopper",
+          title: "Stopper",
+          desc: "Gờ chặn bánh xe ngắn (1 vị trí xe)",
+          refSize: "0.75 x 0.12 x 0.15",
+          key: "0",
+          guideDetail: "Gờ chặn bánh xe ô tô gắn dưới nền bãi đỗ (thanh chữ nhật cho 1 vị trí xe). W: 0.2~0.5, H: 0.1~0.24, L: 0.1~0.3m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 3</b> để set đúng hướng đối tượng hình chữ nhật."
+        },
+        {
+          name: "stopper_long",
+          title: "Stopper Long",
+          desc: "Gờ chặn xe dài",
+          refSize: "1.8 x 0.12 x 0.15",
+          guideDetail: "Gờ chặn bánh xe dạng thanh kéo dài qua nhiều vị trí đỗ. W: 0.6~2.2, H: 0.1~0.24, L: 0.1~0.3m.",
+          guideWarning: "NẾU DÀI HƠN 1 CHỖ ĐỖ XE THÌ KHÔNG ĐƯỢC LABEL!"
+        },
+        {
+          name: "cone",
+          title: "Cone",
+          desc: "Chóp chắn xe / cọc tiêu (đế vuông)",
+          refSize: "0.38 x 0.7 x 0.38",
+          key: "9",
+          guideDetail: "Chóp chắn xe hình nón / cọc tiêu phản quang trong bãi đỗ xe. W: 0.25~0.45, H: 0.2~1.0, L: 0.25~0.45m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 2</b> để set đúng hướng đối tượng hình vuông."
+        },
+        {
+          name: "bollard",
+          title: "Bollard",
+          desc: "Trụ chắn bãi đỗ xe (dạng tròn)",
+          refSize: "0.25 x 0.9 x 0.25",
+          guideDetail: "Trụ chắn đỗ xe dạng cột trụ hình tròn đứng. W: 0.1~0.29, H: 0.2~1.2, L: 0.1~0.29m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 1</b> để set đúng hướng đối tượng hình tròn."
+        },
+        {
+          name: "bollard_u",
+          title: "Bollard U",
+          desc: "Trụ chắn dạng chữ U ngược",
+          refSize: "0.6 x 0.8 x 0.15",
+          guideDetail: "Trụ chắn đỗ xe bằng ống kim loại uốn cong dạng chữ U ngược trong bãi xe. W: 0.5~1.7, H: 0.3~1.0, L: 0.1~0.3m."
+        },
+        {
+          name: "pillar",
+          title: "Pillar (Vuông)",
+          desc: "Cột trụ bãi xe hình vuông/chữ nhật (đáy -> trần)",
+          refSize: "0.7 x 2.8 x 0.7",
+          guideDetail: "Cột trụ chịu lực trong tầng hầm / bãi xe có thiết diện hình vuông hoặc hình chữ nhật. W: 0.2~2.5, H: 2.0~100, L: 0.2~2.5m.",
+          guideRules: "• Chiều rộng & chiều dài: khớp chính xác mặt đáy dưới sàn.<br>• Chiều cao: kéo chạm kịch đến trần nhà!"
+        },
+        {
+          name: "pillar_circle",
+          title: "Pillar (Tròn)",
+          desc: "Cột trụ bãi xe hình tròn (đáy -> trần)",
+          refSize: "0.7 x 2.8 x 0.7",
+          guideDetail: "Cột trụ bãi xe có thiết diện hình tròn. W: 0.2~2.5, H: 2.0~100, L: 0.2~2.5m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 1</b> để set đúng hướng đối tượng hình tròn.<br>• Chiều cao kéo kịch trần."
+        },
+        {
+          name: "pillar_unknown",
+          title: "Pillar (Khác/Unknown)",
+          desc: "Cột trụ hình dạng đặc thù khác hoặc bị khuất",
+          refSize: "0.7 x 2.8 x 0.7",
+          guideDetail: "Cột trụ trong tầng hầm/bãi xe có hình dạng đặc thù (vát góc, đa giác...) hoặc bị khuất không rõ hình dạng. W: 0.2~2.5, H: 2.0~100, L: 0.2~2.5m.",
+          guideRules: "• Chiều rộng/dài theo đáy sàn, chiều cao kéo kịch trần nhà."
+        },
+        {
+          name: "speedbump",
+          title: "Speed Bump",
+          desc: "Gờ giảm tốc",
+          refSize: "0.5 x 0.1 x 2.0",
+          guideDetail: "Gờ giảm tốc cao su hoặc sơn gờ trên mặt đường bãi xe. W: 1.0~10.0, H: 0.1~0.25, L: 0.9~2.0m. Nhấn <b>Alt + 3</b> để set hướng chữ nhật.",
+          guideRules: "• Chỉ labeling trường hợp có gờ nhô cao rõ rệt trên mặt đường.",
+          guideWarning: "NẾU DÀI HƠN 3 LÀN ĐƯỜNG THÌ KHÔNG ĐƯỢC LABEL!"
+        },
+        {
+          name: "no_park_sign_circle",
+          title: "No Parking (Tròn)",
+          desc: "Biển cấm đỗ xe cọc/đế tròn",
+          refSize: "0.4 x 0.9 x 0.4",
+          guideDetail: "Biển báo cấm đỗ xe đặt trong khuôn viên bãi xe dạng cọc đứng hoặc chân đế hình tròn. W: 0.25~0.6, H: 0.5~1.4, L: 0.25~0.6m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 1</b> để set đúng hướng đối tượng hình tròn."
+        },
+        {
+          name: "no_park_sign_square",
+          title: "No Parking (Vuông)",
+          desc: "Biển cấm đỗ xe chữ A / đế vuông",
+          refSize: "0.45 x 0.8 x 0.45",
+          guideDetail: "Biển báo cấm đỗ xe đặt trong khuôn viên bãi xe dạng biển nhựa gấp chữ A hoặc chân đế vuông. W: 0.25~0.6, H: 0.5~1.4, L: 0.25~0.6m.",
+          guideRules: "• Sau khi tạo Cuboid, nhấn tổ hợp phím <b>Alt + 2</b> để set đúng hướng đối tượng hình vuông."
+        },
+        {
+          name: "parking_gate_body",
+          title: "Gate Body",
+          desc: "Thân trụ của thanh chắn barie",
+          refSize: "0.45 x 1.1 x 0.45",
+          guideDetail: "Chỉ gán nhãn phần thân trụ của thanh chắn ra vào bãi đỗ xe. W: 0.2~0.8, H: 0.8~2.0, L: 0.2~0.8m.",
+          guideRules: "• Loại trừ thanh bar, loại trừ máy thanh toán tự động và máy phát vé."
+        },
+        {
+          name: "close_bar",
+          title: "Close Bar (Đóng)",
+          desc: "Thanh chắn barie ĐÓNG (nằm ngang)",
+          refSize: "3.0 x 0.15 x 0.1",
+          guideDetail: "Thanh bar của barrier khi đang ở trạng thái đóng (nằm ngang chắn đường xe). W: 1.0~6.0, H: 1.0~2.0, L: 0.1~0.6m.",
+          guideRules: "• TÁCH RIÊNG với thân trụ (parking_gate_body). Gán sát chiều dài thanh chắn."
+        },
+        {
+          name: "moving_bar",
+          title: "Moving Bar (Đang mở)",
+          desc: "Thanh chắn barie ĐANG MỞ (ở góc chéo)",
+          refSize: "2.5 x 1.5 x 0.1",
+          guideDetail: "Thanh bar của barrier khi đang trong quá trình nâng lên hoặc hạ xuống (ở vị trí góc chéo). W: 0.3~6.0, H: 0.3~6.0, L: 0.1~0.6m.",
+          guideRules: "• TÁCH RIÊNG với thân trụ (parking_gate_body)."
+        },
+        {
+          name: "open_bar",
+          title: "Open Bar (Mở)",
+          desc: "Thanh chắn barie MỞ (dựng đứng)",
+          refSize: "0.15 x 3.0 x 0.1",
+          guideDetail: "Thanh bar của barrier khi đang ở trạng thái mở hoàn toàn (dựng đứng vuông góc với mặt đất). W: 0.2~2.0, H: 1.0~6.0, L: 0.1~0.6m.",
+          guideRules: "• TÁCH RIÊNG với thân trụ (parking_gate_body)."
+        },
+        {
+          name: "parking_locker",
+          title: "Parking Locker",
+          desc: "Khóa chặn đỗ xe / parking locker",
+          refSize: "0.5 x 0.2 x 0.3",
+          guideDetail: "Khóa chặn vị trí đỗ xe tự động thông minh gắn dưới nền mặt sàn. W: 0.4~0.6, H: 0.1~0.3, L: 0.1~0.4m."
+        },
+        {
+          name: "unknown_parking_obstacle",
+          title: "Unknown Obstacle",
+          desc: "Chướng ngại vật bãi đỗ khác...",
+          refSize: "0.5 x 0.5 x 0.5",
+          guideDetail: "Các đối tượng chướng ngại vật khác trong bãi đỗ xe như trụ sạc xe điện, thanh chắn barrier di động... W: 0.1~2.5, H: 0.05~1.5, L: 0.1~2.5m.",
+          guideWarning: "CÁC VẬT THỂ SAU KHÔNG PHẢI PARKING OBSTACLE (KHÔNG LABEL): Dải phân cách nhựa PE, dải phân cách kim loại, biển báo giao thông ngoài đường, cột trụ không thuộc bãi xe!"
+        }
+      ]
+    }  ];
+
+  let currentActiveSubclass = null;
+
+  // =========================================================================
+  // 2. DICTIONARY & TRANSLATION ENGINE (Korean -> English)
+  // =========================================================================
+
+  const TRANSLATION_MAP = [
+    // Top Bar & Controls
+    ['단축키 안내', 'Shortcuts Guide'],
+    ['JSON 불러오기', 'Import JSON'],
+    ['시점 초기화 (Ctrl+X)', 'Reset View (Ctrl+X)'],
+    ['시점 초기화', 'Reset View'],
+    ['PCD 파일명 검색', 'Search PCD File'],
+
+    // Box Attribute Panel
+    ['서브클래스', 'Subclass'],
+    ['서브Class', 'Subclass'],
+    ['클래스', 'Class'],
+    ['크기', 'Size'],
+    ['카테고리', 'Category'],
+    ['미지정', 'Unspecified'],
+    ['허용 범위 이탈', 'Out of range'],
+    ['크기가 맞다면 subclass 오지정일 수 있으니 subclass를 확인하세요', 'If size is correct, verify subclass'],
+    ['length (전후, 로컬 +x)', 'Length (Front-Back, Local +X)'],
+    ['width (좌우, 로컬 +y)', 'Width (Left-Right, Local +Y)'],
+    ['height (상하)', 'Height (Up-Down)'],
+    ['포즈', 'Pose'],
+    ['위치', 'Location'],
+    ['회전', 'Rotation'],
+
+    // Sidebar - Display (표시)
+    ['표시', 'Display'],
+    ['포인트 크기', 'Point Size'],
+    ['선 두께', 'Line Thickness'],
+    ['카메라 선 두께', 'Camera Line Thickness'],
+    ['착색 기준', 'Color Mode'],
+    ['높이', 'Height'],
+    ['착색 배율', 'Color Scale'],
+    ['선택 박스만 표시 (O키)', 'Selected Box Only (O)'],
+    ['선택 박스만 표시', 'Selected Box Only'],
+    ['객체 ID 표시 (I키)', 'Show Object ID (I)'],
+    ['객체 ID 표시', 'Show Object ID'],
+    ['높이(Z) 필터', 'Height (Z) Filter'],
+
+    // Sidebar - Controls / Manipulation (조작)
+    ['조작', 'Controls'],
+    ['이동 스텝', 'Move Step'],
+    ['회전 스텝', 'Rotation Step'],
+    ['카메라 속도', 'Camera Speed'],
+
+    // Sidebar - ROI & Presets
+    ['ROI 영역', 'ROI Area'],
+    ['프리셋 적용 (경계 테두리 포함)', 'Apply Preset (incl. border)'],
+    ['프리셋 적용', 'Apply Preset'],
+    ['전체 지우기', 'Clear All'],
+    ['기본값으로 초기화', 'Reset to Defaults'],
+
+    // Common labels / Dialogs
+    ['단축키', 'Shortcuts'],
+    ['불러오기', 'Import'],
+    ['저장', 'Save'],
+    ['삭제', 'Delete'],
+    ['초기화', 'Reset'],
+    ['검색', 'Search'],
+    ['설정', 'Settings'],
+    ['객체', 'Object'],
+    ['카메라', 'Camera']
+  ];
+
+  function translateString(str) {
+    if (!str || typeof str !== 'string') return str;
+    let res = str;
+    for (let i = 0; i < TRANSLATION_MAP.length; i++) {
+      const [ko, en] = TRANSLATION_MAP[i];
+      if (res === ko) return en;
+      if (res.includes(ko)) res = res.replaceAll(ko, en);
+    }
+    return res;
+  }
+
+  function translateNode(node) {
+    if (!node) return;
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      if (node.id === 'ado-custom-taskbar' || (node.closest && node.closest('#ado-custom-taskbar')) ||
+          node.id === 'ado-class-flyout' || (node.closest && node.closest('#ado-class-flyout')) ||
+          node.id === 'ado-hotkey-modal-overlay' || (node.closest && node.closest('#ado-hotkey-modal-overlay')) ||
+          node.id === 'ado-top-active-class' || (node.closest && node.closest('#ado-top-active-class')) ||
+          node.id === 'ado-copy-confirm-modal' || (node.closest && node.closest('#ado-copy-confirm-modal')) ||
+          node.id === 'ado-l-confirm-modal' || (node.closest && node.closest('#ado-l-confirm-modal')) ||
+          node.id === 'ado-quick-to-modal' || (node.closest && node.closest('#ado-quick-to-modal')) ||
+          node.id === 'ado-subclass-desc-overlay' || (node.closest && node.closest('#ado-subclass-desc-overlay')) ||
+          (node.classList && node.classList.contains('ado-cam-toggle-btn')) || (node.closest && node.closest('.ado-cam-toggle-btn'))) {
+        return;
+      }
+      const title = node.getAttribute('title');
+      if (title && /[\uac00-\ud7af]/.test(title)) node.setAttribute('title', translateString(title));
+      const ariaLabel = node.getAttribute('aria-label');
+      if (ariaLabel && /[\uac00-\ud7af]/.test(ariaLabel)) node.setAttribute('aria-label', translateString(ariaLabel));
+      const placeholder = node.getAttribute('placeholder');
+      if (placeholder && /[\uac00-\ud7af]/.test(placeholder)) node.setAttribute('placeholder', translateString(placeholder));
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const val = node.nodeValue;
+      if (val && /[\uac00-\ud7af]/.test(val)) {
+        const translated = translateString(val);
+        if (translated !== val) node.nodeValue = translated;
+      }
+      return;
+    }
+
+    let child = node.firstChild;
+    while (child) {
+      translateNode(child);
+      child = child.nextSibling;
+    }
+  }
+
+  let isTranslating = false;
+  function triggerTranslation() {
+    if (isTranslating) return;
+    isTranslating = true;
+    requestAnimationFrame(() => {
+      translateNode(document.body);
+      isTranslating = false;
+    });
+  }
+
+  // =========================================================================
+  // 3. AUTO SELECT ROI (PJT64_Cuboid)
+  // =========================================================================
+
+  let hasAutoSelectedROI = false;
+
+  function tryAutoSelectROI() {
+    if (hasAutoSelectedROI) return true;
+    const buttons = document.querySelectorAll('button');
+    for (const btn of buttons) {
+      if (btn.textContent && btn.textContent.trim() === 'PJT64_Cuboid') {
+        btn.click();
+        hasAutoSelectedROI = true;
+        console.log('[ADO Helper] Auto-selected ROI: PJT64_Cuboid');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // =========================================================================
+  // 4. PRECISE SELECTOR: FIND THE CURRENT BOX'S CATEGORY & SUBCLASS SELECTS
+  // =========================================================================
+
+  function findCategoryAndSubclassSelects() {
+    const allSelects = Array.from(document.querySelectorAll('select'));
+
+    // Method 1: Find the select whose options have VEHICLE and PARKING_OBSTACLE
+    for (const sel of allSelects) {
+      const vals = Array.from(sel.options).map(o => o.value);
+      if (vals.includes('VEHICLE') && vals.includes('PARKING_OBSTACLE')) {
+        const parent = sel.parentElement;
+        if (parent) {
+          const sibling = parent.querySelector('select:nth-of-type(2)') ||
+                          Array.from(parent.querySelectorAll('select')).find(s => s !== sel);
+          if (sibling) {
+            return { categorySelect: sel, subclassSelect: sibling };
+          }
+        }
+      }
+    }
+
+    // Method 2: Match by title (Category / 카테고리)
+    const catSel = document.querySelector('select[title="Category"], select[title="카테고리"], select[title*="Category"], select[title*="카테고리"]');
+    if (catSel && catSel.parentElement) {
+      const subSel = catSel.parentElement.querySelector('select:nth-of-type(2)');
+      if (subSel) return { categorySelect: catSel, subclassSelect: subSel };
+    }
+
+    return null;
+  }
+
+  // Set real React state on a <select> element
+  function setSelectRealReactValue(selectEl, targetValue) {
+    if (!selectEl) return false;
+
+    // 1. Find matching option (case-insensitive)
+    const options = Array.from(selectEl.options);
+    const matchedOpt = options.find(o =>
+      o.value.toLowerCase() === targetValue.toLowerCase() ||
+      o.text.toLowerCase() === targetValue.toLowerCase()
+    );
+
+    if (!matchedOpt) {
+      console.warn(`[ADO Helper] Option '${targetValue}' not found in:`, selectEl);
+      return false;
+    }
+
+    const realValue = matchedOpt.value;
+
+    // 2. Select option in DOM
+    for (let i = 0; i < selectEl.options.length; i++) {
+      selectEl.options[i].selected = (selectEl.options[i].value === realValue);
+    }
+    selectEl.selectedIndex = matchedOpt.index;
+
+    // 3. Clear React value tracker so React doesn't ignore the change
+    if (selectEl._valueTracker) {
+      selectEl._valueTracker.setValue('__REACT_FORCE_UPDATE__');
+    }
+
+    // 4. Use HTMLSelectElement prototype setter
+    const proto = window.HTMLSelectElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(selectEl, realValue);
+    } else {
+      selectEl.value = realValue;
+    }
+
+    // 5. Dispatch native events with bubbles & composed
+    selectEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    selectEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+    // 6. Invoke React __reactProps$ onChange directly
+    const propsKey = Object.keys(selectEl).find(k => k.startsWith('__reactProps$'));
+    if (propsKey && selectEl[propsKey]) {
+      const props = selectEl[propsKey];
+      if (typeof props.onChange === 'function') {
+        try {
+          props.onChange({
+            target: selectEl,
+            currentTarget: selectEl,
+            bubbles: true,
+            defaultPrevented: false,
+            nativeEvent: new Event('change')
+          });
+          console.log(`[ADO Helper] Called __reactProps onChange directly: ${realValue}`);
+        } catch (e) {
+          console.warn('[ADO Helper] Direct __reactProps onChange error:', e);
+        }
+      }
+    }
+
+    // 7. Invoke React Fiber onChange directly
+    const fiberKey = Object.keys(selectEl).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (fiberKey && selectEl[fiberKey]) {
+      let cur = selectEl[fiberKey];
+      let depth = 0;
+      while (cur && depth < 15) {
+        if (cur.memoizedProps && typeof cur.memoizedProps.onChange === 'function') {
+          try {
+            cur.memoizedProps.onChange({
+              target: selectEl,
+              currentTarget: selectEl,
+              bubbles: true,
+              defaultPrevented: false,
+              nativeEvent: new Event('change')
+            });
+            console.log(`[ADO Helper] Called React fiber onChange directly: ${realValue}`);
+          } catch (e) {}
+          break;
+        }
+        cur = cur.return;
+        depth++;
+      }
+    }
+
+    return true;
+  }
+
+  // =========================================================================
+  // 5. DIRECT HOTKEY DISPATCH (KEYS 1-9, 0) FOR REFERENCE DIMENSIONS
+  // =========================================================================
+
+  function dispatchDimensionHotkey(digitChar) {
+    if (!digitChar) return;
+
+    // 1. Ensure focus is NOT inside any select or input
+    if (document.activeElement && (document.activeElement.tagName === 'SELECT' || document.activeElement.tagName === 'INPUT')) {
+      document.activeElement.blur();
+    }
+
+    // 2. Focus 3D canvas so the tool's 3D key listener catches it
+    const canvas = document.querySelector('canvas');
+    if (canvas && typeof canvas.focus === 'function') {
+      canvas.focus();
+    }
+
+    const keyCode = 48 + parseInt(digitChar, 10);
+    const code = digitChar === '0' ? 'Digit0' : `Digit${digitChar}`;
+    const numpadCode = digitChar === '0' ? 'Numpad0' : `Numpad${digitChar}`;
+    const numpadKeyCode = 96 + parseInt(digitChar, 10);
+
+    const targets = [window, document, document.body, canvas].filter(Boolean);
+
+    // Standard Digit key (e.g. Digit3)
+    const digitOpts = {
+      key: digitChar,
+      code: code,
+      keyCode: keyCode,
+      which: keyCode,
+      charCode: keyCode,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: false
+    };
+
+    targets.forEach(t => {
+      t.dispatchEvent(new KeyboardEvent('keydown', digitOpts));
+      t.dispatchEvent(new KeyboardEvent('keypress', digitOpts));
+      t.dispatchEvent(new KeyboardEvent('keyup', digitOpts));
+    });
+
+    // Numpad key backup
+    const numpadOpts = {
+      key: digitChar,
+      code: numpadCode,
+      keyCode: numpadKeyCode,
+      which: numpadKeyCode,
+      charCode: numpadKeyCode,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: false
+    };
+
+    targets.forEach(t => {
+      t.dispatchEvent(new KeyboardEvent('keydown', numpadOpts));
+      t.dispatchEvent(new KeyboardEvent('keyup', numpadOpts));
+    });
+
+    console.log(`[ADO Helper] Dispatched dimension hotkey '${digitChar}' (code: ${code}, keyCode: ${keyCode})`);
+  }
+
+  // Asynchronous change: Set Category first, wait for Subclass to unlock, then set Subclass
+  async function changeCategoryAndSubclass(group, sub) {
+    let selects = findCategoryAndSubclassSelects();
+    if (!selects) {
+      showToast("⚠️ Chưa chọn box! Hãy click chọn 1 box trong 3D rồi bấm lại.");
+      return false;
+    }
+
+    let { categorySelect, subclassSelect } = selects;
+
+    // Step 1: Set Category if it's currently different
+    if (categorySelect.value.toUpperCase() !== group.category.toUpperCase()) {
+      console.log(`[ADO Helper] Setting Category to: ${group.category}`);
+      setSelectRealReactValue(categorySelect, group.category);
+
+      // Wait up to 600ms for React to populate the Subclass select and remove 'disabled'
+      let populated = false;
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 20));
+
+        // Re-query in case React remounted the DOM elements
+        const fresh = findCategoryAndSubclassSelects();
+        if (fresh) {
+          subclassSelect = fresh.subclassSelect;
+          categorySelect = fresh.categorySelect;
+        }
+
+        if (subclassSelect && !subclassSelect.disabled && subclassSelect.options.length > 1) {
+          const hasOption = Array.from(subclassSelect.options).some(o =>
+            o.value.toLowerCase() === sub.name.toLowerCase() ||
+            o.text.toLowerCase() === sub.name.toLowerCase()
+          );
+          if (hasOption) {
+            populated = true;
+            break;
+          }
+        }
+      }
+
+      if (!populated) {
+        console.warn(`[ADO Helper] Subclass option '${sub.name}' not yet populated after wait`);
+      }
+    }
+
+    // Step 2: Set Subclass
+    console.log(`[ADO Helper] Setting Subclass to: ${sub.name}`);
+    const ok = setSelectRealReactValue(subclassSelect, sub.name);
+
+    // Step 3: Trigger reference dimension hotkey (Keys 1-9, 0)
+    if (sub.key) {
+      await new Promise(r => setTimeout(r, 60));
+      dispatchDimensionHotkey(sub.key);
+      setTimeout(() => dispatchDimensionHotkey(sub.key), 150);
+    }
+
+    return ok;
+  }
+
+  // Handler when user clicks a Subclass button on toolbar
+  async function handleSubclassClick(group, sub) {
+    const selects = findCategoryAndSubclassSelects();
+    if (!selects) {
+      showToast(`⚠️ Chưa chọn box! Hãy click chọn 1 box trong 3D trước rồi bấm lại.`);
+      return;
+    }
+
+    const ok = await changeCategoryAndSubclass(group, sub);
+    if (ok) {
+      currentActiveSubclass = {
+        category: group.category,
+        subclass: sub.name,
+        title: sub.title,
+        refSize: sub.refSize || 'Default',
+        key: sub.key
+      };
+      updateTopActiveBadge();
+      const keyMsg = sub.key ? ` (Đã ấn phím <b>${sub.key}</b>)` : '';
+      showToast(`✅ Đã đặt: <b>${sub.title}</b> [${sub.refSize || 'OK'}]${keyMsg}`);
+    } else {
+      showToast(`⚠️ Không thể đổi sang <b>${sub.title}</b>! Kiểm tra lại box đang chọn.`);
+    }
+  }
+
+  // =========================================================================
+  // 6. TOAST NOTIFICATION
+  // =========================================================================
+
+  function showToast(html) {
+    let toast = document.getElementById('ado-floating-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'ado-floating-toast';
+      Object.assign(toast.style, {
+        position: 'fixed',
+        bottom: '68px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: '10000020',
+        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+        border: '1px solid rgba(251, 191, 36, 0.6)',
+        color: '#f8fafc',
+        fontSize: '11px',
+        fontWeight: '500',
+        padding: '6px 14px',
+        borderRadius: '9999px',
+        boxShadow: '0 8px 24px rgba(0,0,0,0.7)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        pointerEvents: 'none',
+        transition: 'opacity 0.2s ease',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+      });
+      document.body.appendChild(toast);
+    }
+    toast.innerHTML = html;
+    toast.style.display = 'flex';
+    toast.style.opacity = '1';
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => {
+      toast.style.opacity = '0';
+      setTimeout(() => { toast.style.display = 'none'; }, 200);
+    }, 2800);
+  }
+
+  // =========================================================================
+  // 7. COMPREHENSIVE VIETNAMESE SHORTCUT GUIDE MODAL WITH SEARCH & KEY LOCK
+  // =========================================================================
+
+  const HOTKEY_DATA = [
+    {
+      group: "1. Khung hình & Chuỗi (Frame · Sequence)",
+      color: "#38bdf8",
+      items: [
+        { keys: ["←"], name: "Frame trước đó", desc: "Chuyển về frame trước (tự động lưu frame hiện tại trước khi chuyển)" },
+        { keys: ["→", "Space"], name: "Frame tiếp theo", desc: "Chuyển sang frame kế tiếp (tự động lưu frame hiện tại trước khi chuyển)" },
+        { keys: ["C"], name: "Xóa toàn bộ Annotation", desc: "Xóa sạch tất cả các box trong frame hiện tại (có xác nhận, khôi phục bằng Ctrl+Z)" },
+        { keys: ["L"], name: "Sao chép từ Frame trước", desc: "Copy toàn bộ box từ frame trước sang frame này (ghi đè nội dung, khôi phục bằng Ctrl+Z)" },
+        { keys: ["M"], name: "Đồng bộ kích thước theo ID", desc: "Đồng bộ W/H/L của box cho tất cả các frame có cùng ID trong chuỗi sequence (lưu ngay lập tức)" }
+      ]
+    },
+    {
+      group: "2. Tạo & Chọn đối tượng (Create · Select)",
+      color: "#4ade80",
+      items: [
+        { keys: ["Shift + Click"], name: "Tạo Box Cuboid mới", desc: "Tạo box 3D mới theo class đang chọn tại vị trí click trên đám mây điểm PCD" },
+        { keys: ["Click"], name: "Chọn Box", desc: "Click chuột trái vào box để chọn và mở bảng thuộc tính" },
+        { keys: ["Ctrl + Click"], name: "Chọn nhiều Box (Multi-select)", desc: "Bật / tắt chọn nhiều box cùng lúc để chỉnh sửa hoặc di chuyển nhóm" },
+        { keys: ["J", "K"], name: "Chọn tất cả / Bỏ chọn", desc: "J: Chọn tất cả các box trong frame | K: Bỏ chọn toàn bộ" },
+        { keys: ["Tab", "Shift + Tab"], name: "Duyệt Box tiếp / trước", desc: "Tab: Nhảy tới box kế tiếp | Shift+Tab: Nhảy về box phía trước" },
+        { keys: ["Del", "Backspace"], name: "Xóa Box đang chọn", desc: "Xóa box đang được chọn hiện tại" },
+        { keys: ["Esc"], name: "Hủy thao tác / Bỏ chọn", desc: "Hủy thao tác đang làm dở hoặc bỏ chọn box" },
+        { keys: ["O"], name: "Chỉ hiển thị Box đang chọn", desc: "Bật/Tắt chế độ chỉ hiển thị duy nhất box đang chọn (ẩn các box khác để dễ nhìn)" },
+        { keys: ["I"], name: "Bật/Tắt hiển thị Object ID", desc: "Ẩn/Hiện chữ số ID trên ảnh camera — hình hộp box vẫn hiển thị" }
+      ]
+    },
+    {
+      group: "3. Di chuyển & Co giãn kích thước 3D (Move · Resize 3D)",
+      color: "#fbbf24",
+      items: [
+        { keys: ["W", "S"], name: "Di chuyển Tiến / Lùi (Trước - Sau)", desc: "W: Tiến tới | S: Lùi lại. Giữ Shift để tăng tốc độ gấp 2 lần. Khi multi-select, W/A/S/D di chuyển toàn bộ box theo màn hình" },
+        { keys: ["A", "D"], name: "Di chuyển Trái / Phải", desc: "A: Sang trái | D: Sang phải. Giữ Shift để tăng tốc gấp 2 lần" },
+        { keys: ["R", "F"], name: "Nâng Lên / Hạ Xuống (Độ cao Z)", desc: "R: Nâng lên | F: Hạ xuống. Giữ Shift để tăng tốc gấp 2 lần" },
+        { keys: ["Ctrl + Phím di chuyển"], name: "⭐ Co giãn kích thước trực tiếp (Resize)", desc: "Ctrl+W/S: Kéo dài / thu ngắn Dài (Length) | Ctrl+A/D: Mở rộng / thu hẹp Rộng (Width) | Ctrl+R/F: Nâng cao / hạ thấp Cao (Height). Giữ thêm Shift để co giãn gấp 2 lần! Mặt đối diện được giữ cố định." },
+        { keys: ["0 ~ 9", "-"], name: "⭐ Áp kích thước chuẩn (Preset Size)", desc: "Phím 1~9, 0 và phím -: Đặt ngay kích thước chuẩn theo Guideline (vị trí và góc xoay giữ nguyên). 1: Sedan, 2: SUV, 3: BUS, 4: Truck, 5: Van, 6: Moto, 7: Xe đạp, 8: Cart, 9: Cone, 0: Stopper, -: Preset mở rộng" },
+        { keys: ["Kéo chuột góc"], name: "Kéo chuột trên khung chiếu (Section View)", desc: "Dùng chuột kéo các góc hoặc cạnh trên 3 khung nhìn cắt TOP, SIDE, FRONT để căn khít điểm LiDAR" }
+      ]
+    },
+    {
+      group: "4. Xoay & Căn chỉnh hướng (Rotate · Align)",
+      color: "#a78bfa",
+      items: [
+        { keys: ["Q", "E"], name: "Xoay góc Yaw (Quay ngang)", desc: "Q: Xoay sang trái | E: Xoay sang phải. Giữ Shift để xoay theo bước nhảy cố định 90°" },
+        { keys: ["T", "G"], name: "Xoay góc Pitch (Nghiêng dọc)", desc: "T / G: Chỉnh góc chúc đầu hoặc ngửa mũi của box" },
+        { keys: ["Y", "H"], name: "Xoay góc Roll (Nghiêng ngang)", desc: "Y / H: Chỉnh góc nghiêng sườn trái hoặc sườn phải" },
+        { keys: ["Alt + 1"], name: "Căn về góc tối thiểu (0° ego vehicle)", desc: "Căn hướng box thẳng góc 0° so với xe cảm biến (ego vehicle) - Thích hợp cho vật thể tròn" },
+        { keys: ["Alt + 2"], name: "Tự động khớp hướng (Auto-fit heading)", desc: "Tự động tính toán hướng xoay khớp nhất với đám mây điểm LiDAR - Thích hợp cho chóp nón/vật thể vuông" },
+        { keys: ["Alt + 3"], name: "Đưa cạnh dài ra phía trước", desc: "Xoay cạnh dài nhất của box hướng về phía trước - Thích hợp cho gờ chặn xe (stopper), gờ giảm tốc" }
+      ]
+    },
+    {
+      group: "5. Chỉnh sửa & Bộ nhớ tạm (Edit · Clipboard)",
+      color: "#f43f5e",
+      items: [
+        { keys: ["Ctrl + Z", "Ctrl + Y"], name: "Hoàn tác / Làm lại (Undo/Redo)", desc: "Ctrl+Z: Lùi lại thao tác trước | Ctrl+Y: Làm lại thao tác vừa lùi" },
+        { keys: ["Ctrl + C"], name: "Sao chép Box (Copy)", desc: "Copy box đang chọn vào bộ nhớ tạm" },
+        { keys: ["Ctrl + V"], name: "Dán Box (Paste)", desc: "Dán box đã copy tại vị trí con trỏ chuột hiện tại" },
+        { keys: ["Ctrl + Shift + V"], name: "Ghi đè Box (Overwrite)", desc: "Ghi đè thông số từ box vừa copy vào box đang chọn" },
+        { keys: ["Nhập ID bên phải"], name: "Đổi Tracking ID", desc: "Nhập số ID đối tượng tại bảng bên phải (phải là duy nhất trong cùng một frame)" }
+      ]
+    },
+    {
+      group: "6. Điều khiển góc nhìn 3D (View Control)",
+      color: "#2dd4bf",
+      items: [
+        { keys: ["Kéo chuột trái"], name: "Lia góc nhìn (Pan View)", desc: "Kéo từ khoảng trống — hoặc nhấn chuột giữa kéo — hoặc giữ Space + kéo chuột trái" },
+        { keys: ["Kéo chuột phải"], name: "Xoay góc nhìn 3D (Rotate View)", desc: "Xoay quanh không gian 3D quan sát đám mây điểm" },
+        { keys: ["Lăn chuột (Wheel)"], name: "Thu phóng (Zoom In/Out)", desc: "Lăn bánh xe chuột để phóng to hoặc thu nhỏ góc nhìn" },
+        { keys: ["Ctrl + X"], name: "Đặt lại góc nhìn (Reset View)", desc: "Khởi tạo lại góc nhìn 3D về vị trí mặc định ban đầu" }
+      ]
+    },
+    {
+      group: "7. Cài đặt bước nhảy (Step Settings)",
+      color: "#e879f9",
+      items: [
+        { keys: ["[", "]"], name: "Giảm / Tăng bước di chuyển", desc: "Giảm hoặc tăng khoảng cách dịch chuyển cho mỗi lần nhấn phím W/S/A/D/R/F" },
+        { keys: ["Shift + [", "Shift + ]"], name: "Giảm / Tăng bước xoay", desc: "Giảm hoặc tăng góc quay cho mỗi lần nhấn phím xoay Q/E/T/G/Y/H" }
+      ]
+    },
+    {
+      group: "8. Khung nhìn Camera 2D (Camera View - 2D Box Mode)",
+      color: "#38bdf8",
+      items: [
+        { keys: ["Click chuột phải ảnh"], name: "Bật/Tắt chế độ Box 2D", desc: "Click chuột phải vào ảnh camera để vào chế độ chỉnh sửa box 2D" },
+        { keys: ["W / S / A / D"], name: "Di chuyển Box 2D", desc: "Dịch chuyển box trên khung ảnh camera (Giữ Shift để tăng tốc gấp 2 lần)" },
+        { keys: ["Ctrl + W/S/A/D"], name: "Co giãn kích thước Box 2D", desc: "Kéo giãn box 2D trên ảnh camera (có thể kéo góc bằng chuột)" },
+        { keys: ["B"], name: "Ẩn box trên Camera này", desc: "Bắt buộc ẩn box đang chọn trên góc camera hiện tại" },
+        { keys: ["R"], name: "Gắn lại phép chiếu tự động", desc: "Khôi phục lại liên kết chiếu tự động từ 3D LiDAR sang camera" },
+        { keys: ["`", "~"], name: "⭐ Bật/Tắt Viewmode Camera 2D", desc: "Bật/Tắt chế độ nhận diện và làm sáng viền camera 2D đang chứa box. Có nút tick chọn thủ công trên từng camera." },
+        { keys: ["Chuột giữa", ","], name: "🎛️ Bảng T/O Chỉnh Nhanh (Viewmode)", desc: "Ấn chuột giữa vào camera 2D hoặc bấm phím , để mở bảng T/O nhanh bên khung LiDAR (không che cam 2D). Lăn chuột đổi số 0-4. Kèm bảng quy ước % mức độ." },
+        { keys: ["Click chip camera"], name: "Chuyển 1 camera / Lưới 4 camera", desc: "Click vào thẻ tên FRONT, REAR, LEFT, RIGHT để phóng to 1 camera hoặc xem đủ 4 góc" }
+      ]
+    }
+  ];
+
+  let hotkeyModalOverlay = null;
+  let isHotkeyModalOpen = false;
+
+  function createHotkeyModal() {
+    if (hotkeyModalOverlay) return hotkeyModalOverlay;
+
+    hotkeyModalOverlay = document.createElement('div');
+    hotkeyModalOverlay.id = 'ado-hotkey-modal-overlay';
+    Object.assign(hotkeyModalOverlay.style, {
+      position: 'fixed',
+      inset: '0',
+      zIndex: '10000050',
+      backgroundColor: 'rgba(2, 6, 23, 0.85)',
+      backdropFilter: 'blur(6px)',
+      display: 'none',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+    });
+
+    const card = document.createElement('div');
+    card.id = 'ado-hotkey-modal-card';
+    Object.assign(card.style, {
+      width: '740px',
+      maxWidth: '94vw',
+      maxHeight: '86vh',
+      backgroundColor: '#0f172a',
+      border: '1px solid #334155',
+      borderRadius: '14px',
+      boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.95), 0 0 1px 1px rgba(255, 255, 255, 0.08)',
+      display: 'flex',
+      flexDirection: 'column',
+      overflow: 'hidden',
+      color: '#e2e8f0'
+    });
+
+    // 1. Header
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      padding: '14px 20px',
+      borderBottom: '1px solid #1e293b',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      backgroundColor: 'rgba(15, 23, 42, 0.9)'
+    });
+
+    header.innerHTML = `
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span style="font-size:20px;">⌨️</span>
+        <div>
+          <div style="font-size:15px; font-weight:700; color:#f8fafc;">Bảng Hướng Dẫn Phím Tắt Toàn Diện (Shortcut Guide)</div>
+          <div style="font-size:11px; color:#94a3b8;">ALCHERA ADO 3D Cuboid Annotation · Bản dịch Tiếng Việt chuẩn hóa</div>
+        </div>
+      </div>
+    `;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.innerHTML = `&times;`;
+    closeBtn.title = 'Đóng (Esc)';
+    Object.assign(closeBtn.style, {
+      background: 'none',
+      border: 'none',
+      color: '#94a3b8',
+      fontSize: '26px',
+      cursor: 'pointer',
+      padding: '0 6px',
+      lineHeight: '1',
+      transition: 'color 0.15s ease'
+    });
+    closeBtn.onmouseenter = () => { closeBtn.style.color = '#f8fafc'; };
+    closeBtn.onmouseleave = () => { closeBtn.style.color = '#94a3b8'; };
+    closeBtn.onclick = () => closeHotkeyModal();
+    header.appendChild(closeBtn);
+    card.appendChild(header);
+
+    // 2. Search Box Container
+    const searchContainer = document.createElement('div');
+    Object.assign(searchContainer.style, {
+      padding: '12px 20px',
+      backgroundColor: '#1e293b',
+      borderBottom: '1px solid #334155',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px'
+    });
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'ado-hotkey-search-box';
+    searchInput.placeholder = '🔍 Gõ từ khóa tìm kiếm (ví dụ: kích thước, resize, xoay, frame, xóa, copy, W, S, A, D, 1, 2, 3...)...';
+    Object.assign(searchInput.style, {
+      width: '100%',
+      padding: '8px 14px',
+      borderRadius: '8px',
+      border: '1px solid #475569',
+      backgroundColor: '#090d16',
+      color: '#f8fafc',
+      fontSize: '12.5px',
+      outline: 'none',
+      transition: 'border-color 0.15s ease',
+      boxSizing: 'border-box'
+    });
+    searchInput.onfocus = () => { searchInput.style.borderColor = '#fbbf24'; };
+    searchInput.onblur = () => { searchInput.style.borderColor = '#475569'; };
+
+    searchContainer.appendChild(searchInput);
+
+    // Quick tag pills
+    const quickTags = document.createElement('div');
+    Object.assign(quickTags.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      flexWrap: 'wrap'
+    });
+
+    const tagList = [
+      { label: 'Tất cả', q: '' },
+      { label: '📐 Kích thước (Resize)', q: 'kích thước' },
+      { label: '📦 Tạo & Chọn Box', q: 'chọn' },
+      { label: '🔄 Xoay hướng', q: 'xoay' },
+      { label: '🎞️ Khung hình (Frame)', q: 'frame' },
+      { label: '📷 Camera 2D', q: 'camera' }
+    ];
+
+    tagList.forEach(t => {
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.textContent = t.label;
+      Object.assign(pill.style, {
+        padding: '3px 9px',
+        borderRadius: '9999px',
+        backgroundColor: '#0f172a',
+        border: '1px solid #334155',
+        color: '#94a3b8',
+        fontSize: '11px',
+        cursor: 'pointer',
+        transition: 'all 0.15s ease'
+      });
+      pill.onmouseenter = () => {
+        pill.style.borderColor = '#fbbf24';
+        pill.style.color = '#fbbf24';
+      };
+      pill.onmouseleave = () => {
+        pill.style.borderColor = '#334155';
+        pill.style.color = '#94a3b8';
+      };
+      pill.onclick = () => {
+        searchInput.value = t.q;
+        renderHotkeyContent(t.q);
+      };
+      quickTags.appendChild(pill);
+    });
+
+    searchContainer.appendChild(quickTags);
+    card.appendChild(searchContainer);
+
+    // 3. Scrollable Content Area
+    const contentArea = document.createElement('div');
+    contentArea.id = 'ado-hotkey-content-area';
+    Object.assign(contentArea.style, {
+      padding: '16px 20px',
+      overflowY: 'auto',
+      maxHeight: 'calc(86vh - 180px)',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '20px',
+      scrollbarWidth: 'thin'
+    });
+
+    card.appendChild(contentArea);
+
+    // 4. Footer
+    const footer = document.createElement('div');
+    Object.assign(footer.style, {
+      padding: '10px 20px',
+      borderTop: '1px solid #1e293b',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      backgroundColor: '#090d16',
+      fontSize: '11.5px',
+      color: '#64748b'
+    });
+    footer.innerHTML = `
+      <span>💡 <i>Mẹo:</i> Đang mở bảng này sẽ <b>khóa toàn bộ phím tắt của web</b> để bạn thoải mái gõ tìm kiếm.</span>
+      <span style="color:#94a3b8;">Nhấn <b>Esc</b> hoặc nút <b>&times;</b> để đóng</span>
+    `;
+    card.appendChild(footer);
+
+    hotkeyModalOverlay.appendChild(card);
+    document.body.appendChild(hotkeyModalOverlay);
+
+    // Click outside backdrop to close
+    hotkeyModalOverlay.onclick = (e) => {
+      if (e.target === hotkeyModalOverlay) {
+        closeHotkeyModal();
+      }
+    };
+
+    // Live search event
+    searchInput.oninput = (e) => {
+      renderHotkeyContent(e.target.value.trim());
+    };
+    searchInput.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        closeHotkeyModal();
+        e.preventDefault();
+      }
+    };
+    searchInput.onkeyup = (e) => e.stopPropagation();
+    searchInput.onkeypress = (e) => e.stopPropagation();
+
+    return hotkeyModalOverlay;
+  }
+
+  function renderHotkeyContent(query = '') {
+    const container = document.getElementById('ado-hotkey-content-area');
+    if (!container) return;
+
+    container.innerHTML = '';
+    const q = query.toLowerCase();
+    let totalMatches = 0;
+
+    HOTKEY_DATA.forEach(group => {
+      const filteredItems = group.items.filter(item => {
+        if (!q) return true;
+        const inKeys = item.keys.some(k => k.toLowerCase().includes(q));
+        const inName = item.name.toLowerCase().includes(q);
+        const inDesc = item.desc.toLowerCase().includes(q);
+        const inGroup = group.group.toLowerCase().includes(q);
+        return inKeys || inName || inDesc || inGroup;
+      });
+
+      if (filteredItems.length === 0) return;
+      totalMatches += filteredItems.length;
+
+      const groupSection = document.createElement('div');
+      groupSection.style.display = 'flex';
+      groupSection.style.flexDirection = 'column';
+      groupSection.style.gap = '8px';
+
+      const groupTitle = document.createElement('div');
+      Object.assign(groupTitle.style, {
+        fontSize: '13px',
+        fontWeight: '700',
+        color: group.color || '#38bdf8',
+        borderBottom: `1px solid ${group.color}40`,
+        paddingBottom: '4px',
+        textTransform: 'uppercase',
+        letterSpacing: '0.03em'
+      });
+      groupTitle.textContent = group.group;
+      groupSection.appendChild(groupTitle);
+
+      const itemsList = document.createElement('div');
+      Object.assign(itemsList.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '6px'
+      });
+
+      filteredItems.forEach(item => {
+        const row = document.createElement('div');
+        Object.assign(row.style, {
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'space-between',
+          gap: '12px',
+          padding: '8px 12px',
+          borderRadius: '8px',
+          backgroundColor: 'rgba(30, 41, 59, 0.4)',
+          border: '1px solid rgba(51, 65, 85, 0.4)'
+        });
+
+        // Left info
+        const infoDiv = document.createElement('div');
+        infoDiv.style.flex = '1';
+        infoDiv.innerHTML = `
+          <div style="font-size:12px; font-weight:600; color:#f1f5f9;">${item.name}</div>
+          <div style="font-size:11px; color:#94a3b8; margin-top:2px; line-height:1.4;">${item.desc}</div>
+        `;
+        row.appendChild(infoDiv);
+
+        // Right keys
+        const keysDiv = document.createElement('div');
+        Object.assign(keysDiv.style, {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '4px',
+          flexShrink: '0'
+        });
+
+        item.keys.forEach(k => {
+          const kbd = document.createElement('kbd');
+          kbd.textContent = k;
+          Object.assign(kbd.style, {
+            display: 'inline-block',
+            padding: '3px 7px',
+            fontSize: '11px',
+            fontFamily: 'ui-monospace, monospace',
+            fontWeight: 'bold',
+            color: '#fbbf24',
+            backgroundColor: '#1e293b',
+            border: '1px solid #475569',
+            borderRadius: '5px',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.5)',
+            whiteSpace: 'nowrap'
+          });
+          keysDiv.appendChild(kbd);
+        });
+
+        row.appendChild(keysDiv);
+        itemsList.appendChild(row);
+      });
+
+      groupSection.appendChild(itemsList);
+      container.appendChild(groupSection);
+    });
+
+    if (totalMatches === 0) {
+      const empty = document.createElement('div');
+      Object.assign(empty.style, {
+        padding: '30px',
+        textAlign: 'center',
+        color: '#64748b',
+        fontSize: '13px'
+      });
+      empty.innerHTML = `Không tìm thấy phím tắt nào khớp với từ khóa "<b>${query}</b>"!`;
+      container.appendChild(empty);
+    }
+  }
+
+  function openHotkeyModal() {
+    createHotkeyModal();
+    isHotkeyModalOpen = true;
+    hotkeyModalOverlay.style.display = 'flex';
+
+    const searchInput = document.getElementById('ado-hotkey-search-box');
+    if (searchInput) {
+      searchInput.value = '';
+      setTimeout(() => searchInput.focus(), 80);
+    }
+    renderHotkeyContent('');
+  }
+
+  function closeHotkeyModal() {
+    if (hotkeyModalOverlay) {
+      hotkeyModalOverlay.style.display = 'none';
+    }
+    isHotkeyModalOpen = false;
+  }
+
+  // =========================================================================
+  // 8. KEYBOARD EVENT INTERCEPTOR: LOCK WEB HOTKEYS WHILE MODAL IS OPEN
+  // =========================================================================
+
+  function handleModalKeyEvent(e) {
+    if (!isHotkeyModalOpen) return;
+
+    // Esc closes modal
+    if (e.key === 'Escape') {
+      closeHotkeyModal();
+      e.stopPropagation();
+      e.preventDefault();
+      return;
+    }
+
+    // If the event is inside our modal (e.g. typing in search input),
+    // let the input receive the keystroke, but stop it from bubbling to the web app Three.js listeners!
+    if (e.target && (e.target.id === 'ado-hotkey-search-box' || (e.target.closest && e.target.closest('#ado-hotkey-modal-card')))) {
+      // Do not prevent default so text is entered in input, but stop propagation
+      e.stopPropagation();
+      return;
+    }
+
+    // If outside, block completely
+    e.stopPropagation();
+    e.preventDefault();
+  }
+
+  window.addEventListener('keydown', handleModalKeyEvent, true);
+  window.addEventListener('keyup', (e) => {
+    if (isHotkeyModalOpen) {
+      e.stopPropagation();
+    }
+  }, true);
+  window.addEventListener('keypress', (e) => {
+    if (isHotkeyModalOpen && e.target && e.target.id !== 'ado-hotkey-search-box') {
+      e.stopPropagation();
+    }
+  }, true);
+
+  // =========================================================================
+  // 9. FLOATING SUBCLASS FLYOUT MENU (HOVER ABOVE CLASS BUTTON)
+  // =========================================================================
+
+  let flyoutEl = null;
+  let flyoutCloseTimer = null;
+
+  function getOrCreateFlyout() {
+    if (flyoutEl) return flyoutEl;
+    flyoutEl = document.createElement('div');
+    flyoutEl.id = 'ado-class-flyout';
+    Object.assign(flyoutEl.style, {
+      position: 'fixed',
+      zIndex: '10000010',
+      backgroundColor: 'rgba(15, 23, 42, 0.96)',
+      backdropFilter: 'blur(16px)',
+      border: '1px solid rgba(51, 65, 85, 0.9)',
+      borderRadius: '12px',
+      boxShadow: '0 12px 35px rgba(0, 0, 0, 0.85), 0 0 1px 1px rgba(255, 255, 255, 0.05)',
+      padding: '10px',
+      display: 'none',
+      flexDirection: 'column',
+      gap: '8px',
+      width: '320px',
+      maxHeight: '460px',
+      overflowY: 'auto',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      userSelect: 'none'
+    });
+
+    flyoutEl.addEventListener('mouseenter', () => {
+      clearTimeout(flyoutCloseTimer);
+    });
+
+    flyoutEl.addEventListener('mouseleave', () => {
+      hideSubclassOverlay();
+      flyoutCloseTimer = setTimeout(() => {
+        flyoutEl.style.display = 'none';
+      }, 150);
+    });
+
+    document.body.appendChild(flyoutEl);
+    return flyoutEl;
+  }
+
+  let subclassOverlayEl = null;
+
+  function getOrCreateSubclassOverlay() {
+    if (subclassOverlayEl) return subclassOverlayEl;
+
+    subclassOverlayEl = document.createElement('div');
+    subclassOverlayEl.id = 'ado-subclass-desc-overlay';
+    Object.assign(subclassOverlayEl.style, {
+      position: 'fixed',
+      zIndex: '10000060',
+      width: '330px',
+      maxWidth: '92vw',
+      backgroundColor: '#090d16',
+      border: '1px solid #3b82f6',
+      borderRadius: '10px',
+      boxShadow: '0 20px 45px -10px rgba(0, 0, 0, 0.95), 0 0 15px rgba(59, 130, 246, 0.25)',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      color: '#f1f5f9',
+      padding: '10px 12px',
+      display: 'none',
+      flexDirection: 'column',
+      gap: '6px',
+      pointerEvents: 'none',
+      userSelect: 'none',
+      lineHeight: '1.45'
+    });
+
+    document.body.appendChild(subclassOverlayEl);
+    return subclassOverlayEl;
+  }
+
+  function showSubclassOverlay(sub, group, anchorEl) {
+    const overlay = getOrCreateSubclassOverlay();
+
+    const keyBadge = sub.key ? `<span style="font-size:9.5px; background:#eab308; color:#0f172a; padding:1px 6px; border-radius:4px; font-weight:800;">Phím ${sub.key}</span>` : '';
+    const sizeBadge = sub.refSize ? `
+      <div style="display:flex; align-items:center; justify-content:space-between; background:rgba(30, 41, 59, 0.6); padding:3px 8px; border-radius:5px; border:1px solid #334155; font-size:10.5px;">
+        <span style="color:#94a3b8;">📏 Chuẩn (W×H×L):</span>
+        <b style="color:#38bdf8; font-family:ui-monospace, monospace;">${sub.refSize} m</b>
+        ${sub.key ? `<span style="color:#cbd5e1; font-size:9.5px;">(Ctrl+${sub.key})</span>` : ''}
+      </div>` : '';
+
+    const rulesSection = sub.guideRules ? `
+      <div style="font-size:10.5px; color:#cbd5e1; background:rgba(15, 23, 42, 0.85); border-left:2.5px solid #38bdf8; padding:4px 8px; border-radius:0 5px 5px 0; line-height:1.45;">
+        ${sub.guideRules}
+      </div>` : '';
+
+    const warningSection = sub.guideWarning ? `
+      <div style="font-size:10.5px; color:#fca5a5; background:rgba(220, 38, 38, 0.15); border:1px solid rgba(239, 68, 68, 0.4); padding:4px 8px; border-radius:5px; display:flex; align-items:flex-start; gap:5px; line-height:1.4;">
+        <span style="font-size:12px; line-height:1;">⚠️</span><span>${sub.guideWarning}</span>
+      </div>` : '';
+
+    overlay.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:5px;">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <span style="font-size:14px;">${group.label.split(' ')[0] || '🏷️'}</span>
+          <span style="font-size:12.5px; font-weight:800; color:#fbbf24;">${sub.title}</span>
+        </div>
+        <div style="display:flex; gap:4px; align-items:center;">
+          <span style="font-size:9.5px; background:rgba(59, 130, 246, 0.25); color:#93c5fd; border:1px solid rgba(59, 130, 246, 0.5); padding:1px 6px; border-radius:4px; font-weight:700;">${group.category}</span>
+          ${keyBadge}
+        </div>
+      </div>
+      ${sizeBadge}
+      <div style="font-size:11px; color:#e2e8f0; line-height:1.45;">
+        ${sub.guideDetail || sub.desc}
+      </div>
+      ${rulesSection}
+      ${warningSection}
+    `;
+
+    const rect = anchorEl.getBoundingClientRect();
+    const winWidth = window.innerWidth;
+    const winHeight = window.innerHeight;
+    const overlayW = 330;
+
+    let left = rect.right + 10;
+    if (left + overlayW > winWidth) {
+      left = Math.max(10, rect.left - overlayW - 10);
+    }
+
+    let top = rect.top - 20;
+    if (top + 280 > winHeight) {
+      top = Math.max(10, winHeight - 290);
+    }
+    if (top < 10) top = 10;
+
+    overlay.style.left = `${left}px`;
+    overlay.style.top = `${top}px`;
+    overlay.style.display = 'flex';
+  }
+
+  function hideSubclassOverlay() {
+    if (subclassOverlayEl) {
+      subclassOverlayEl.style.display = 'none';
+    }
+  }
+
+  function showFlyoutForGroup(group, anchorBtn) {
+    const flyout = getOrCreateFlyout();
+    clearTimeout(flyoutCloseTimer);
+
+    flyout.innerHTML = '';
+
+    // 1. Header
+    const header = document.createElement('div');
+    Object.assign(header.style, {
+      padding: '4px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(30, 41, 59, 0.8)',
+      border: '1px solid rgba(51, 65, 85, 0.6)',
+      fontSize: '11px',
+      fontWeight: '700',
+      color: '#fbbf24',
+      textTransform: 'uppercase',
+      letterSpacing: '0.04em',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between'
+    });
+    header.innerHTML = `<span>${group.title}</span><span style="font-size:10px; color:#94a3b8; font-weight:normal;">${group.subclasses.length} subclasses</span>`;
+    flyout.appendChild(header);
+
+    // 2. Subclasses Grid
+    const grid = document.createElement('div');
+    Object.assign(grid.style, {
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gap: '6px',
+      marginTop: '2px'
+    });
+
+    group.subclasses.forEach((sub, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+
+      const isOddLast = group.subclasses.length % 2 !== 0 && idx === group.subclasses.length - 1;
+      Object.assign(btn.style, {
+        padding: '6px 8px',
+        fontSize: '11px',
+        fontWeight: '600',
+        backgroundColor: 'rgba(30, 41, 59, 0.7)',
+        border: '1px solid rgba(51, 65, 85, 0.7)',
+        borderRadius: '6px',
+        color: '#f1f5f9',
+        cursor: 'pointer',
+        textAlign: 'left',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '2px',
+        transition: 'all 0.15s ease',
+        gridColumn: isOddLast ? 'span 2' : 'span 1'
+      });
+
+      const keyBadge = sub.key ? `<span style="font-size:9px; background:#eab308; color:#0f172a; padding:1px 4px; border-radius:4px; font-weight:bold;">Phím ${sub.key}</span>` : '';
+      const sizeText = sub.refSize ? `<span style="font-size:9.5px; color:#94a3b8; font-family:monospace;">${sub.refSize}</span>` : `<span style="font-size:9.5px; color:#64748b;">(Tự do)</span>`;
+
+      btn.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; width:100%;">
+          <span style="font-weight:700; color:#e2e8f0;">${sub.title}</span>
+          ${keyBadge}
+        </div>
+        ${sizeText}
+      `;
+
+      btn.onmouseenter = () => {
+        btn.style.backgroundColor = 'rgba(59, 130, 246, 0.25)';
+        btn.style.borderColor = '#3b82f6';
+        btn.style.color = '#ffffff';
+        showSubclassOverlay(sub, group, btn);
+      };
+
+      btn.onmouseleave = () => {
+        btn.style.backgroundColor = 'rgba(30, 41, 59, 0.7)';
+        btn.style.borderColor = 'rgba(51, 65, 85, 0.7)';
+        btn.style.color = '#f1f5f9';
+        hideSubclassOverlay();
+      };
+
+      btn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideSubclassOverlay();
+        handleSubclassClick(group, sub);
+        flyout.style.display = 'none';
+      };
+
+      grid.appendChild(btn);
+    });
+
+    flyout.appendChild(grid);
+
+    // Smart Positioning: Pop DOWNWARDS if taskbar is near top, UPWARDS if near bottom
+    const rect = anchorBtn.getBoundingClientRect();
+    const winWidth = window.innerWidth;
+    const winHeight = window.innerHeight;
+    const spaceAbove = rect.top;
+    const spaceBelow = winHeight - rect.bottom;
+
+    if (spaceAbove < 350 || spaceBelow > spaceAbove) {
+      // Pop DOWNWARDS
+      flyout.style.top = `${rect.bottom + 8}px`;
+      flyout.style.bottom = 'auto';
+      flyout.style.maxHeight = `${Math.max(200, Math.min(460, spaceBelow - 20))}px`;
+    } else {
+      // Pop UPWARDS
+      flyout.style.bottom = `${winHeight - rect.top + 8}px`;
+      flyout.style.top = 'auto';
+      flyout.style.maxHeight = `${Math.max(200, Math.min(460, spaceAbove - 20))}px`;
+    }
+
+    let left = rect.left - 30;
+    if (left + 330 > winWidth) left = winWidth - 335;
+    if (left < 10) left = 10;
+    flyout.style.left = `${left}px`;
+
+    flyout.style.display = 'flex';
+  }
+
+  // =========================================================================
+  // 10. TOP ACTIVE CLASS DISPLAY (Clean, No Dimensions)
+  // =========================================================================
+
+  let topBadgeEl = null;
+
+  function updateTopActiveBadge() {
+    if (!topBadgeEl) {
+      topBadgeEl = document.createElement('div');
+      topBadgeEl.id = 'ado-top-active-class';
+      Object.assign(topBadgeEl.style, {
+        position: 'fixed',
+        top: '9px',
+        left: '250px',
+        zIndex: '99999',
+        display: 'none',
+        alignItems: 'center',
+        gap: '6px',
+        padding: '3px 12px',
+        borderRadius: '9999px',
+        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+        border: '1px solid rgba(51, 65, 85, 0.85)',
+        boxShadow: '0 4px 14px rgba(0, 0, 0, 0.6)',
+        fontSize: '11.5px',
+        fontWeight: '700',
+        color: '#f8fafc',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+        userSelect: 'none',
+        transition: 'all 0.2s ease',
+        pointerEvents: 'none'
+      });
+      document.body.appendChild(topBadgeEl);
+    }
+
+    if (currentActiveSubclass) {
+      topBadgeEl.style.display = 'flex';
+      topBadgeEl.innerHTML = `
+        <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:#22c55e; box-shadow:0 0 6px #22c55e;"></span>
+        <span style="color:#94a3b8; font-size:10.5px; font-weight:normal;">Class:</span>
+        <span style="color:#fbbf24; font-weight:700;">${currentActiveSubclass.title}</span>
+      `;
+    } else {
+      topBadgeEl.style.display = 'none';
+    }
+  }
+
+  // =========================================================================
+  // 11. AUTO-ENABLE HEIGHT (Z) FILTER (LUÔN BẬT HEIGHT Z FILTER CHẾ ĐỘ ON)
+  // =========================================================================
+
+  function ensureSettingsTabOpen() {
+    const settingsBtn = document.querySelector('button svg.lucide-settings, button:has(svg.lucide-settings)');
+    const btn = settingsBtn?.closest('button') || settingsBtn;
+    if (btn && btn.getAttribute('aria-pressed') !== 'true') {
+      btn.click();
+      return true;
+    }
+    return false;
+  }
+
+  function findHeightZFilterButtons() {
+    let allSpans = Array.from(document.querySelectorAll('span, div'));
+    let zSpan = allSpans.find(el =>
+      el.children.length === 0 && (el.textContent.includes('(Z)') || el.textContent.includes('높이(Z)') || el.textContent.includes('Height (Z)'))
+    );
+
+    if (!zSpan) {
+      ensureSettingsTabOpen();
+      allSpans = Array.from(document.querySelectorAll('span, div'));
+      zSpan = allSpans.find(el =>
+        el.children.length === 0 && (el.textContent.includes('(Z)') || el.textContent.includes('높이(Z)') || el.textContent.includes('Height (Z)'))
+      );
+    }
+
+    if (zSpan) {
+      const row = zSpan.closest('.flex-row') || zSpan.parentElement?.parentElement;
+      if (row) {
+        const buttons = Array.from(row.querySelectorAll('button'));
+        const onBtn = buttons.find(b => b.textContent.trim() === 'ON');
+        const offBtn = buttons.find(b => b.textContent.trim() === 'OFF');
+        if (onBtn && offBtn) {
+          const isOn = onBtn.classList.contains('bg-emerald-500/20') || onBtn.getAttribute('aria-pressed') === 'true';
+          return { row, onBtn, offBtn, isOn };
+        }
+      }
+    }
+    return null;
+  }
+
+  let hasAutoEnabledHeightZ = false;
+
+  function tryAutoEnableHeightZFilter() {
+    if (hasAutoEnabledHeightZ) return true;
+    const ctrl = findHeightZFilterButtons();
+    if (ctrl) {
+      if (!ctrl.isOn && ctrl.onBtn) {
+        ctrl.onBtn.click();
+        hasAutoEnabledHeightZ = true;
+        showToast("🌲 Đã tự động BẬT Height(Z) Filter (Lọc tán lá)!");
+        return true;
+      } else if (ctrl.isOn) {
+        hasAutoEnabledHeightZ = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // =========================================================================
+  // 12. DRAGGABLE BOTTOM DOCK TASKBAR
+  // =========================================================================
+
+  let taskbarEl = null;
+
+  function createBottomTaskbar() {
+    if (document.getElementById('ado-custom-taskbar')) return;
+
+    taskbarEl = document.createElement('div');
+    taskbarEl.id = 'ado-custom-taskbar';
+
+    Object.assign(taskbarEl.style, {
+      position: 'fixed',
+      bottom: '14px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: '999999',
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      padding: '4px 10px',
+      borderRadius: '9999px',
+      backgroundColor: 'rgba(15, 23, 42, 0.92)',
+      backdropFilter: 'blur(16px)',
+      border: '1px solid rgba(51, 65, 85, 0.75)',
+      boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.65), 0 0 1px 1px rgba(255, 255, 255, 0.05)',
+      color: '#e2e8f0',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      fontSize: '11px',
+      fontWeight: '500',
+      userSelect: 'none'
+    });
+
+    // 1. Drag Handle
+    const dragHandle = document.createElement('div');
+    dragHandle.id = 'ado-taskbar-drag-handle';
+    dragHandle.title = 'Nhấn giữ & kéo thả để di chuyển thanh công cụ';
+    Object.assign(dragHandle.style, {
+      display: 'flex',
+      alignItems: 'center',
+      cursor: 'grab',
+      padding: '2px 5px',
+      color: '#64748b',
+      fontSize: '13px',
+      letterSpacing: '1px'
+    });
+    dragHandle.innerHTML = `&#x2807;&#x2807;`;
+    taskbarEl.appendChild(dragHandle);
+
+    // 2. Brand Label
+    const brand = document.createElement('div');
+    Object.assign(brand.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      fontWeight: '700',
+      color: '#f8fafc',
+      paddingRight: '6px',
+      borderRight: '1px solid rgba(51, 65, 85, 0.6)',
+      fontSize: '11px'
+    });
+    brand.innerHTML = `<span style="color:#fbbf24;">⚡</span> PJT64`;
+    taskbarEl.appendChild(brand);
+
+    // 3. Category Buttons Container (with hover flyout)
+    const categoryButtonsContainer = document.createElement('div');
+    categoryButtonsContainer.id = 'ado-category-buttons';
+    Object.assign(categoryButtonsContainer.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px'
+    });
+
+    PJT64_CLASSES.forEach(group => {
+      const groupBtn = document.createElement('button');
+      groupBtn.type = 'button';
+      groupBtn.innerText = group.label;
+      groupBtn.title = `Rê chuột để chọn Subclass [${group.category}]`;
+      Object.assign(groupBtn.style, {
+        padding: '3px 8px',
+        fontSize: '11px',
+        fontWeight: '600',
+        backgroundColor: 'rgba(30, 41, 59, 0.8)',
+        border: '1px solid rgba(51, 65, 85, 0.6)',
+        borderRadius: '6px',
+        color: '#e2e8f0',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+        transition: 'all 0.15s ease'
+      });
+
+      groupBtn.onmouseenter = () => {
+        groupBtn.style.backgroundColor = 'rgba(59, 130, 246, 0.3)';
+        groupBtn.style.borderColor = '#3b82f6';
+        groupBtn.style.color = '#ffffff';
+        showFlyoutForGroup(group, groupBtn);
+      };
+
+      groupBtn.onmouseleave = () => {
+        groupBtn.style.backgroundColor = 'rgba(30, 41, 59, 0.8)';
+        groupBtn.style.borderColor = 'rgba(51, 65, 85, 0.6)';
+        groupBtn.style.color = '#e2e8f0';
+
+        flyoutCloseTimer = setTimeout(() => {
+          if (flyoutEl) flyoutEl.style.display = 'none';
+        }, 180);
+      };
+
+      categoryButtonsContainer.appendChild(groupBtn);
+    });
+
+    taskbarEl.appendChild(categoryButtonsContainer);
+
+    // 4. Divider 1
+    const div1 = document.createElement('div');
+    Object.assign(div1.style, {
+      width: '1px',
+      height: '16px',
+      backgroundColor: 'rgba(51, 65, 85, 0.6)',
+      margin: '0 2px'
+    });
+    taskbarEl.appendChild(div1);
+    // 5. Nút "Lưu T/O" dạng Dropdown/Flyout (rê chuột vào có 2 lựa chọn)
+    const saveGroup = document.createElement('div');
+    saveGroup.style.position = 'relative';
+    saveGroup.style.display = 'inline-flex';
+
+    const saveMainBtn = document.createElement('button');
+    saveMainBtn.type = 'button';
+    saveMainBtn.title = 'Rê chuột để chọn: Quét từng xe hoặc Quét nhanh Console';
+    Object.assign(saveMainBtn.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '3px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(2, 132, 199, 0.2)',
+      border: '1px solid rgba(2, 132, 199, 0.6)',
+      color: '#38bdf8',
+      fontSize: '11px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      transition: 'all 0.15s ease'
+    });
+    saveMainBtn.innerHTML = `<span>💾</span><span>Lưu T/O</span><span style="font-size:9px; opacity:0.8; margin-left:2px;">▲</span>`;
+
+    const saveMenu = document.createElement('div');
+    Object.assign(saveMenu.style, {
+      position: 'absolute',
+      bottom: 'calc(100% + 6px)',
+      left: '0',
+      minWidth: '175px',
+      backgroundColor: '#0f172a',
+      border: '1px solid #334155',
+      borderRadius: '8px',
+      boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5)',
+      padding: '5px',
+      display: 'none',
+      flexDirection: 'column',
+      gap: '4px',
+      zIndex: '10000050'
+    });
+
+    const optScanDom = document.createElement('button');
+    optScanDom.type = 'button';
+    Object.assign(optScanDom.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      padding: '6px 10px',
+      borderRadius: '5px',
+      backgroundColor: 'transparent',
+      border: 'none',
+      color: '#38bdf8',
+      fontSize: '11.5px',
+      fontWeight: '600',
+      textAlign: 'left',
+      cursor: 'pointer',
+      transition: 'all 0.15s ease'
+    });
+    optScanDom.innerHTML = `<span>🔄</span><span>Quét từng xe</span>`;
+    optScanDom.onmouseenter = () => { optScanDom.style.backgroundColor = 'rgba(2, 132, 199, 0.25)'; };
+    optScanDom.onmouseleave = () => { optScanDom.style.backgroundColor = 'transparent'; };
+    optScanDom.onclick = (e) => {
+      e.stopPropagation();
+      saveMenu.style.display = 'none';
+      saveTempCamAttrs();
+    };
+
+    const optScanConsole = document.createElement('button');
+    optScanConsole.type = 'button';
+    Object.assign(optScanConsole.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      padding: '6px 10px',
+      borderRadius: '5px',
+      backgroundColor: 'transparent',
+      border: 'none',
+      color: '#c084fc',
+      fontSize: '11.5px',
+      fontWeight: '600',
+      textAlign: 'left',
+      cursor: 'pointer',
+      transition: 'all 0.15s ease'
+    });
+    optScanConsole.innerHTML = `<span>⚡</span><span>Quét nhanh Console</span>`;
+    optScanConsole.onmouseenter = () => { optScanConsole.style.backgroundColor = 'rgba(147, 51, 234, 0.25)'; };
+    optScanConsole.onmouseleave = () => { optScanConsole.style.backgroundColor = 'transparent'; };
+    optScanConsole.onclick = (e) => {
+      e.stopPropagation();
+      saveMenu.style.display = 'none';
+      runConsoleScan();
+    };
+
+    saveMenu.appendChild(optScanDom);
+    saveMenu.appendChild(optScanConsole);
+
+    let saveHoverTimeout = null;
+    saveGroup.onmouseenter = () => {
+      clearTimeout(saveHoverTimeout);
+      const sRect = saveGroup.getBoundingClientRect();
+      if (sRect.top < 220) {
+        saveMenu.style.top = 'calc(100% + 6px)';
+        saveMenu.style.bottom = 'auto';
+      } else {
+        saveMenu.style.bottom = 'calc(100% + 6px)';
+        saveMenu.style.top = 'auto';
+      }
+      saveMenu.style.display = 'flex';
+      saveMainBtn.style.backgroundColor = 'rgba(2, 132, 199, 0.35)';
+    };
+    saveGroup.onmouseleave = () => {
+      saveHoverTimeout = setTimeout(() => {
+        saveMenu.style.display = 'none';
+        saveMainBtn.style.backgroundColor = 'rgba(2, 132, 199, 0.2)';
+      }, 150);
+    };
+
+    saveMainBtn.onclick = (e) => {
+      e.stopPropagation();
+      saveTempCamAttrs();
+    };
+
+    saveGroup.appendChild(saveMainBtn);
+    saveGroup.appendChild(saveMenu);
+    taskbarEl.appendChild(saveGroup);
+
+    // 6. Paste Temp T/O Button
+    const pasteTempBtn = document.createElement('button');
+    pasteTempBtn.type = 'button';
+    pasteTempBtn.title = 'Bơm toàn bộ thông số T/O đã Lưu Tạm vào các box trên frame này';
+    Object.assign(pasteTempBtn.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '3px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(22, 163, 74, 0.2)',
+      border: '1px solid rgba(22, 163, 74, 0.6)',
+      color: '#4ade80',
+      fontSize: '11px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      transition: 'all 0.15s ease'
+    });
+    pasteTempBtn.innerHTML = `<span>📥</span><span>Dán T/O</span>`;
+    pasteTempBtn.onmouseenter = () => { pasteTempBtn.style.backgroundColor = 'rgba(22, 163, 74, 0.35)'; };
+    pasteTempBtn.onmouseleave = () => { pasteTempBtn.style.backgroundColor = 'rgba(22, 163, 74, 0.2)'; };
+    pasteTempBtn.onclick = (e) => {
+      e.stopPropagation();
+      pasteTempCamAttrs();
+    };
+    taskbarEl.appendChild(pasteTempBtn);
+
+    // 7. Viewmode Button (Phím ` hoặc ~)
+    const viewmodeBtn = document.createElement('button');
+    viewmodeBtn.id = 'ado-viewmode-btn';
+    viewmodeBtn.type = 'button';
+    viewmodeBtn.title = 'Bật/Tắt Viewmode nhận diện Box trên 4 Camera 2D (Phím ` hoặc ~)';
+    Object.assign(viewmodeBtn.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '3px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(148, 163, 184, 0.15)',
+      border: '1px solid rgba(148, 163, 184, 0.4)',
+      color: '#94a3b8',
+      fontSize: '11px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      transition: 'all 0.15s ease'
+    });
+    viewmodeBtn.innerHTML = `<span>👁️</span><span>Viewmode [~]</span>`;
+    viewmodeBtn.onclick = (e) => {
+      e.stopPropagation();
+      toggleViewmode();
+    };
+    taskbarEl.appendChild(viewmodeBtn);
+
+    // 8. Shortcut Guide Modal Button
+    const hotkeyBtn = document.createElement('button');
+    hotkeyBtn.type = 'button';
+    hotkeyBtn.title = 'Xem toàn bộ Phím tắt tiếng Việt (có ô tìm kiếm nhanh)';
+    Object.assign(hotkeyBtn.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '3px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(59, 130, 246, 0.2)',
+      border: '1px solid rgba(59, 130, 246, 0.5)',
+      color: '#93c5fd',
+      fontSize: '11px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      transition: 'all 0.15s ease'
+    });
+    hotkeyBtn.innerHTML = `<span>⌨️</span><span>Phím tắt</span>`;
+    hotkeyBtn.onmouseenter = () => {
+      hotkeyBtn.style.backgroundColor = 'rgba(59, 130, 246, 0.4)';
+      hotkeyBtn.style.color = '#ffffff';
+    };
+    hotkeyBtn.onmouseleave = () => {
+      hotkeyBtn.style.backgroundColor = 'rgba(59, 130, 246, 0.2)';
+      hotkeyBtn.style.color = '#93c5fd';
+    };
+    hotkeyBtn.onclick = (e) => {
+      e.stopPropagation();
+      openHotkeyModal();
+    };
+    taskbarEl.appendChild(hotkeyBtn);
+
+    // 8.5. Guideline Button (Mở slide Google Presentation trong tab mới)
+    const guideBtn = document.createElement('button');
+    guideBtn.type = 'button';
+    guideBtn.title = 'Mở tài liệu hướng dẫn PJT64 Cuboid Guideline (Google Slide)';
+    Object.assign(guideBtn.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '3px 8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(234, 88, 12, 0.2)',
+      border: '1px solid rgba(234, 88, 12, 0.6)',
+      color: '#fb923c',
+      fontSize: '11px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      transition: 'all 0.15s ease'
+    });
+    guideBtn.innerHTML = `<span>📖</span><span>Guideline</span>`;
+    guideBtn.onmouseenter = () => {
+      guideBtn.style.backgroundColor = 'rgba(234, 88, 12, 0.4)';
+      guideBtn.style.color = '#ffffff';
+    };
+    guideBtn.onmouseleave = () => {
+      guideBtn.style.backgroundColor = 'rgba(234, 88, 12, 0.2)';
+      guideBtn.style.color = '#fb923c';
+    };
+    guideBtn.onclick = (e) => {
+      e.stopPropagation();
+      window.open('https://docs.google.com/presentation/d/1DJzrcUYll6nt3Tli1ycnL_u26WeJobzuj9PrSs21EX4/edit?slide=id.g3bc00b5e388_0_21#slide=id.g3bc00b5e388_0_21', '_blank');
+    };
+    taskbarEl.appendChild(guideBtn);
+
+    // 7. Re-trigger ROI button (mini icon)
+    const roiBtn = document.createElement('button');
+    roiBtn.type = 'button';
+    roiBtn.title = 'Bấm để kích hoạt lại Preset ROI PJT64_Cuboid';
+    Object.assign(roiBtn.style, {
+      background: 'none',
+      border: 'none',
+      cursor: 'pointer',
+      color: '#94a3b8',
+      fontSize: '11px',
+      padding: '2px 4px',
+      borderRadius: '4px'
+    });
+    roiBtn.innerHTML = `🎯`;
+    roiBtn.onmouseover = () => { roiBtn.style.color = '#fbbf24'; };
+    roiBtn.onmouseleave = () => { roiBtn.style.color = '#94a3b8'; };
+    roiBtn.onclick = (e) => {
+      e.stopPropagation();
+      hasAutoSelectedROI = false;
+      if (tryAutoSelectROI()) {
+        showToast("✅ Đã kích hoạt ROI PJT64_Cuboid!");
+      }
+    };
+    taskbarEl.appendChild(roiBtn);
+
+    // 8. Minimize / Collapse Toggle
+    const collapseBtn = document.createElement('button');
+    collapseBtn.type = 'button';
+    collapseBtn.title = 'Thu gọn / Mở rộng thanh taskbar';
+    Object.assign(collapseBtn.style, {
+      background: 'none',
+      border: 'none',
+      color: '#64748b',
+      fontSize: '12px',
+      cursor: 'pointer',
+      padding: '0 4px',
+      lineHeight: '1',
+      outline: 'none'
+    });
+    collapseBtn.innerHTML = `&#x2500;`;
+
+    let isCollapsed = false;
+    collapseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      isCollapsed = !isCollapsed;
+      if (isCollapsed) {
+        brand.style.display = 'none';
+        categoryButtonsContainer.style.display = 'none';
+        div1.style.display = 'none';
+        zBtn.style.display = 'none';
+        hotkeyBtn.style.display = 'none';
+        roiBtn.style.display = 'none';
+        collapseBtn.innerHTML = `&#x25A2;`;
+        taskbarEl.style.padding = '4px 6px';
+      } else {
+        brand.style.display = 'flex';
+        categoryButtonsContainer.style.display = 'flex';
+        div1.style.display = 'block';
+        zBtn.style.display = 'flex';
+        updateZFilterButtonUI();
+        hotkeyBtn.style.display = 'flex';
+        roiBtn.style.display = 'block';
+        collapseBtn.innerHTML = `&#x2500;`;
+        taskbarEl.style.padding = '4px 10px';
+      }
+    });
+    taskbarEl.appendChild(collapseBtn);
+
+    document.body.appendChild(taskbarEl);
+
+    // Prevent canvas interactions while clicking on taskbar
+    taskbarEl.addEventListener('mousedown', (e) => e.stopPropagation());
+    taskbarEl.addEventListener('wheel', (e) => e.stopPropagation());
+
+    // Dragging setup
+    setupDraggable(taskbarEl, dragHandle);
+  }
+
+  // Smooth dragging with viewport bounds
+  function setupDraggable(element, handle) {
+    let isDragging = false;
+    let startX = 0, startY = 0;
+    let initialLeft = 0, initialTop = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      isDragging = true;
+      handle.style.cursor = 'grabbing';
+
+      const rect = element.getBoundingClientRect();
+      element.style.bottom = 'auto';
+      element.style.transform = 'none';
+      element.style.left = `${rect.left}px`;
+      element.style.top = `${rect.top}px`;
+
+      startX = e.clientX;
+      startY = e.clientY;
+      initialLeft = rect.left;
+      initialTop = rect.top;
+
+      function onMouseMove(moveEvent) {
+        if (!isDragging) return;
+        moveEvent.preventDefault();
+
+        const deltaX = moveEvent.clientX - startX;
+        const deltaY = moveEvent.clientY - startY;
+
+        let newLeft = initialLeft + deltaX;
+        let newTop = initialTop + deltaY;
+
+        const winWidth = window.innerWidth;
+        const winHeight = window.innerHeight;
+        const elemWidth = element.offsetWidth;
+        const elemHeight = element.offsetHeight;
+
+        newLeft = Math.max(10, Math.min(newLeft, winWidth - elemWidth - 10));
+        newTop = Math.max(10, Math.min(newTop, winHeight - elemHeight - 10));
+
+        element.style.left = `${newLeft}px`;
+        element.style.top = `${newTop}px`;
+      }
+
+      function onMouseUp() {
+        if (!isDragging) return;
+        isDragging = false;
+        handle.style.cursor = 'grab';
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      }
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
+  }
+
+  // =========================================================================
+  // 13. SMART COPY CAMERA ATTRIBUTES (T/O: TRUNCATION & OCCLUSION)
+  // =========================================================================
+
+  let savedCamAttrs = null;
+  let copyIncludesCam = false;
+  let savedBoxData = null; // { category, subclass, camAttrs }
+  let copyModalOverlay = null;
+
+  function getCameraAttrInputs() {
+    const res = {};
+    const allLis = document.querySelectorAll('li');
+    for (const li of allLis) {
+      const textSpans = Array.from(li.querySelectorAll('span')).map(s => s.textContent.trim().toLowerCase());
+      const camKey = ['front', 'rear', 'left', 'right'].find(c => textSpans.includes(c));
+      if (camKey) {
+        const inputs = li.querySelectorAll('input[type="number"]');
+        if (inputs.length >= 2) {
+          res[camKey] = {
+            tInput: inputs[0],
+            oInput: inputs[1]
+          };
+        }
+      }
+    }
+    return Object.keys(res).length > 0 ? res : null;
+  }
+
+  function readCameraAttrs() {
+    const inputs = getCameraAttrInputs();
+    if (!inputs) return null;
+    const data = {};
+    for (const cam of ['front', 'rear', 'left', 'right']) {
+      if (inputs[cam]) {
+        data[cam] = {
+          t: inputs[cam].tInput.value,
+          o: inputs[cam].oInput.value
+        };
+      }
+    }
+    return data;
+  }
+
+  function setRealReactInputValue(inputEl, val) {
+    if (!inputEl) return false;
+    const strVal = val === null || val === undefined ? '' : String(val);
+
+    if (inputEl._valueTracker) {
+      inputEl._valueTracker.setValue('__REACT_FORCE_UPDATE__');
+    }
+
+    const proto = window.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(inputEl, strVal);
+    } else {
+      inputEl.value = strVal;
+    }
+
+    inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    inputEl.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+
+    const propsKey = Object.keys(inputEl).find(k => k.startsWith('__reactProps$'));
+    if (propsKey && inputEl[propsKey]) {
+      if (typeof inputEl[propsKey].onChange === 'function') {
+        try {
+          inputEl[propsKey].onChange({
+            target: inputEl,
+            currentTarget: inputEl,
+            bubbles: true,
+            defaultPrevented: false
+          });
+        } catch (e) {}
+      }
+      if (typeof inputEl[propsKey].onBlur === 'function') {
+        try {
+          inputEl[propsKey].onBlur({
+            target: inputEl,
+            currentTarget: inputEl,
+            bubbles: true,
+            defaultPrevented: false
+          });
+        } catch (e) {}
+      }
+    }
+
+    const fiberKey = Object.keys(inputEl).find(k => k.startsWith('__reactFiber$'));
+    if (fiberKey && inputEl[fiberKey]) {
+      let cur = inputEl[fiberKey];
+      let depth = 0;
+      while (cur && depth < 15) {
+        if (cur.memoizedProps && typeof cur.memoizedProps.onChange === 'function') {
+          try {
+            cur.memoizedProps.onChange({ target: inputEl, currentTarget: inputEl });
+          } catch (e) {}
+          break;
+        }
+        cur = cur.return;
+        depth++;
+      }
+    }
+
+    return true;
+  }
+
+  function writeCameraAttrs(data) {
+    if (!data) return false;
+    const inputs = getCameraAttrInputs();
+    if (!inputs) return false;
+
+    let count = 0;
+    for (const cam of ['front', 'rear', 'left', 'right']) {
+      if (data[cam] && inputs[cam]) {
+        if (data[cam].t !== undefined && data[cam].t !== '') {
+          setRealReactInputValue(inputs[cam].tInput, data[cam].t);
+          count++;
+        }
+        if (data[cam].o !== undefined && data[cam].o !== '') {
+          setRealReactInputValue(inputs[cam].oInput, data[cam].o);
+          count++;
+        }
+      }
+    }
+    return count > 0;
+  }
+
+  function showCopyConfirmModal(camData) {
+    const selects = findCategoryAndSubclassSelects();
+    const currentCat = selects?.categorySelect?.value || '';
+    const currentSub = selects?.subclassSelect?.value || '';
+
+    if (!copyModalOverlay) {
+      copyModalOverlay = document.createElement('div');
+      copyModalOverlay.id = 'ado-copy-confirm-modal';
+      Object.assign(copyModalOverlay.style, {
+        position: 'fixed',
+        inset: '0',
+        zIndex: '10000060',
+        backgroundColor: 'rgba(2, 6, 23, 0.75)',
+        backdropFilter: 'blur(4px)',
+        display: 'none',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+      });
+
+      const card = document.createElement('div');
+      Object.assign(card.style, {
+        width: '380px',
+        maxWidth: '90vw',
+        padding: '16px 20px',
+        borderRadius: '12px',
+        backgroundColor: '#0f172a',
+        border: '1px solid #334155',
+        boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.9)',
+        color: '#f8fafc',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '12px'
+      });
+
+      card.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:20px;">📋</span>
+          <div>
+            <div style="font-size:14px; font-weight:700; color:#fbbf24;">Sao chép Box (Ctrl+C)</div>
+            <div style="font-size:11px; color:#94a3b8;">Xác nhận thông số Camera (Truncation / Occlusion)</div>
+          </div>
+        </div>
+        <div style="font-size:12px; color:#e2e8f0; line-height:1.5;">
+          Bạn có muốn <b>copy toàn bộ thông số</b> bao gồm cả <b>T & O</b> của 4 camera (Front, Rear, Left, Right) không?
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+          <button id="ado-copy-no-btn" type="button" style="padding:6px 14px; border-radius:6px; background:#1e293b; border:1px solid #475569; color:#94a3b8; font-weight:600; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            Không (No) [N / Esc]
+          </button>
+          <button id="ado-copy-yes-btn" type="button" style="padding:6px 16px; border-radius:6px; background:#2563eb; border:1px solid #3b82f6; color:#ffffff; font-weight:700; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            Có (Yes) [Y / Enter]
+          </button>
+        </div>
+      `;
+
+      copyModalOverlay.appendChild(card);
+      document.body.appendChild(copyModalOverlay);
+    }
+
+    const yesBtn = copyModalOverlay.querySelector('#ado-copy-yes-btn');
+    const noBtn = copyModalOverlay.querySelector('#ado-copy-no-btn');
+
+    function chooseYes() {
+      savedCamAttrs = camData;
+      copyIncludesCam = true;
+      savedBoxData = { category: currentCat, subclass: currentSub, camAttrs: camData };
+      copyModalOverlay.style.display = 'none';
+      window.removeEventListener('keydown', onConfirmKeyDown, true);
+      const catText = currentCat ? `[${currentCat} / ${currentSub}] ` : '';
+      showToast(`✅ Đã copy box ${catText}<b>kèm toàn bộ thông số Camera (T/O)</b>!`);
+    }
+
+    function chooseNo() {
+      savedCamAttrs = null;
+      copyIncludesCam = false;
+      savedBoxData = { category: currentCat, subclass: currentSub, camAttrs: null };
+      copyModalOverlay.style.display = 'none';
+      window.removeEventListener('keydown', onConfirmKeyDown, true);
+      const catText = currentCat ? `[${currentCat} / ${currentSub}] ` : '';
+      showToast(`📋 Đã copy box ${catText}(<b>không gồm T/O</b>).`);
+    }
+
+    function onConfirmKeyDown(e) {
+      if (copyModalOverlay.style.display !== 'none') {
+        if (e.key === 'y' || e.key === 'Y' || e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          chooseYes();
+        } else if (e.key === 'n' || e.key === 'N' || e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          chooseNo();
+        }
+      }
+    }
+
+    yesBtn.onclick = (e) => { e.stopPropagation(); chooseYes(); };
+    noBtn.onclick = (e) => { e.stopPropagation(); chooseNo(); };
+
+    window.addEventListener('keydown', onConfirmKeyDown, true);
+
+    copyModalOverlay.style.display = 'flex';
+  }
+
+  // =========================================================================
+  // 13. SMART COPY, SAVE TEMP & SMART "L" (PERSISTENT VIA LOCALSTORAGE)
+  // =========================================================================
+
+  const camAttrCacheById = new Map();
+
+  // Load any previously stored cache from localStorage
+  try {
+    const initStored = JSON.parse(localStorage.getItem('ado_temp_cam_attrs') || '{}');
+    for (const [k, v] of Object.entries(initStored)) {
+      camAttrCacheById.set(k, v);
+    }
+  } catch (e) {}
+
+  function findCurrentActiveBoxId() {
+    const allHeaders = Array.from(document.querySelectorAll('span, button, h1, h2, h3, div'));
+    for (const el of allHeaders) {
+      const txt = (el.textContent || '').trim();
+      if ((txt.includes('카메라') || txt.toLowerCase().includes('camera')) && /#\d+/.test(txt)) {
+        const m = txt.match(/#(\d+)/);
+        if (m) return m[1];
+      }
+    }
+    for (const el of allHeaders) {
+      const txt = (el.textContent || '').trim();
+      if ((txt.includes('클래스') || txt.toLowerCase().includes('class')) && /#\d+/.test(txt)) {
+        const m = txt.match(/#(\d+)/);
+        if (m) return m[1];
+      }
+    }
+    const aside = document.querySelector('aside');
+    if (aside) {
+      const idSpans = Array.from(aside.querySelectorAll('span, button, div')).filter(el =>
+        el.children.length === 0 && /^#\d+$/.test(el.textContent.trim())
+      );
+      if (idSpans.length > 0) {
+        return idSpans[0].textContent.trim().replace('#', '');
+      }
+    }
+    return null;
+  }
+
+  // =========================================================================
+  // 13.5. VIEWMODE: 2D CAMERA BOX DETECTION, GLOWING BORDER & MANUAL TOGGLE (HOTKEY ` OR ~)
+  // =========================================================================
+
+  let isViewmodeActive = false;
+  const viewmodeBoxCamMap = new Map(); // boxId -> Set(['FRONT', ...])
+  let lastViewmodeBoxId = null;
+  const CAM_NAMES = ['FRONT', 'REAR', 'LEFT', 'RIGHT'];
+
+  // Xác nhận chắc chắn 100% đang có 1 box được chọn
+  function isBoxSelected() {
+    const curId = findCurrentActiveBoxId();
+    if (curId) return true;
+    const selects = findCategoryAndSubclassSelects();
+    if (selects && selects.categorySelect && selects.categorySelect.offsetParent !== null) {
+      return true;
+    }
+    const aside = document.querySelector('aside');
+    if (aside) {
+      const txt = aside.textContent || '';
+      if (/#\d+/.test(txt) && (txt.includes('Length') || txt.includes('크기') || txt.includes('Size') || txt.includes('Pose'))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Lấy các phần tử DOM của từng camera
+  function getCameraElements(camName) {
+    const img = document.querySelector(`img[alt="${camName}"]`);
+    if (!img) return null;
+    const container = img.closest('.relative') || img.parentElement;
+    const svg = container ? container.querySelector('svg') : null;
+    const origBadge = container ? container.querySelector('button:not(.ado-cam-toggle-btn)') : null;
+    return { img, container, svg, origBadge };
+  }
+
+  // Tự động nhận diện DUY NHẤT box ĐANG ĐƯỢC CHỌN xuất hiện trên camera nào
+  function autoDetectCamerasForBox() {
+    const detected = new Set();
+    const curBoxId = findCurrentActiveBoxId();
+
+    CAM_NAMES.forEach(camName => {
+      const cam = getCameraElements(camName);
+      if (!cam || !cam.svg) return;
+
+      let hasSelectedBox = false;
+
+      // 1. Quét theo thẻ <text> trong SVG: Khung nhìn của camera nào chứa box đang chọn
+      // sẽ có thẻ text in đúng số tracking ID của box đó (ví dụ: <text>1</text>)
+      if (curBoxId) {
+        const textNodes = Array.from(cam.svg.querySelectorAll('text'));
+        const matched = textNodes.some(t => (t.textContent || '').trim() === String(curBoxId));
+        if (matched) {
+          hasSelectedBox = true;
+        }
+      }
+
+      // 2. Quét theo màu vàng (#ffff00): Box đang chọn trên 2D luôn có nét viền (stroke) hoặc chữ (fill) màu vàng thuần
+      if (!hasSelectedBox) {
+        const yellowNodes = cam.svg.querySelectorAll('[stroke="#ffff00"], [stroke*="255, 255, 0"], [fill="#ffff00"], [fill*="255, 255, 0"]');
+        if (yellowNodes.length > 0) {
+          hasSelectedBox = true;
+        }
+      }
+
+      if (hasSelectedBox) {
+        detected.add(camName);
+      }
+    });
+
+    return detected;
+  }
+
+  // Cập nhật giao diện viền sáng & nút tick chọn cho từng camera
+  function renderCameraViewmodeState(camName, isSelected) {
+    const cam = getCameraElements(camName);
+    if (!cam || !cam.container) return;
+
+    // 1. Viền sáng phát sáng xung quanh khung camera (Glowing Border)
+    if (isViewmodeActive && isSelected) {
+      cam.container.style.outline = '3px solid #10b981';
+      cam.container.style.outlineOffset = '-3px';
+      cam.container.style.boxShadow = 'inset 0 0 22px rgba(16, 185, 129, 0.28), 0 0 18px rgba(16, 185, 129, 0.65)';
+      if (cam.origBadge) {
+        cam.origBadge.style.borderColor = '#10b981';
+        cam.origBadge.style.color = '#34d399';
+      }
+    } else {
+      cam.container.style.outline = '';
+      cam.container.style.outlineOffset = '';
+      cam.container.style.boxShadow = '';
+      if (cam.origBadge) {
+        cam.origBadge.style.borderColor = '';
+        cam.origBadge.style.color = '';
+      }
+    }
+
+    // 2. Nút chọn riêng độc lập trên từng Camera (Góc trên bên trái)
+    let toggleBtn = cam.container.querySelector(`.ado-cam-toggle-btn[data-cam="${camName}"]`);
+    if (!toggleBtn) {
+      toggleBtn = document.createElement('button');
+      toggleBtn.type = 'button';
+      toggleBtn.className = 'ado-cam-toggle-btn';
+      toggleBtn.setAttribute('data-cam', camName);
+      Object.assign(toggleBtn.style, {
+        position: 'absolute',
+        top: '6px',
+        left: '6px',
+        zIndex: '30',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        padding: '3px 8px',
+        borderRadius: '9999px',
+        fontSize: '10.5px',
+        fontWeight: '700',
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+        userSelect: 'none'
+      });
+
+      toggleBtn.onclick = (e) => {
+        // CHÍNH XÁC LÀ CHUỘT TRÁI (e.button === 0) VÀ CHỈ TRÊN ĐÚNG NÚT TICK NÀY
+        if (e.button !== 0) return;
+        e.stopPropagation();
+        e.preventDefault();
+        onCameraToggleClick(camName);
+      };
+
+      toggleBtn.oncontextmenu = (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+      };
+
+      cam.container.appendChild(toggleBtn);
+    }
+
+    if (isViewmodeActive) {
+      toggleBtn.style.display = 'flex';
+      if (isSelected) {
+        toggleBtn.style.backgroundColor = 'rgba(16, 185, 129, 0.92)';
+        toggleBtn.style.border = '1px solid #34d399';
+        toggleBtn.style.color = '#ffffff';
+        toggleBtn.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.5)';
+        toggleBtn.title = `Click để BỎ CHỌN camera ${camName} cho box này`;
+        toggleBtn.innerHTML = `<span>✓</span><span>Có box</span>`;
+      } else {
+        toggleBtn.style.backgroundColor = 'rgba(15, 23, 42, 0.85)';
+        toggleBtn.style.border = '1px solid rgba(71, 85, 105, 0.7)';
+        toggleBtn.style.color = '#94a3b8';
+        toggleBtn.style.boxShadow = 'none';
+        toggleBtn.title = `Click để CHỌN THÊM camera ${camName} cho box này`;
+        toggleBtn.innerHTML = `<span>○</span><span>Không box</span>`;
+      }
+    } else {
+      toggleBtn.style.display = 'none';
+    }
+  }
+
+  // Xử lý khi người dùng tự click tick chọn / bỏ chọn trên từng camera
+  function onCameraToggleClick(camName) {
+    if (!isViewmodeActive) return;
+    if (!isBoxSelected()) {
+      showToast("⚠️ Chưa chọn box! Hãy click chọn 1 box trong LiDAR 3D trước.");
+      return;
+    }
+
+    const boxId = findCurrentActiveBoxId() || 'active';
+    let currentSet = viewmodeBoxCamMap.get(boxId);
+    if (!currentSet) {
+      currentSet = autoDetectCamerasForBox();
+    }
+
+    if (currentSet.has(camName)) {
+      currentSet.delete(camName);
+      showToast(`📸 Đã <b>bỏ chọn</b> camera <b>${camName}</b> cho box #${boxId}`);
+    } else {
+      currentSet.add(camName);
+      showToast(`📸 Đã <b>chọn thêm</b> camera <b>${camName}</b> cho box #${boxId}`);
+    }
+
+    viewmodeBoxCamMap.set(boxId, currentSet);
+    updateViewmodeUI();
+  }
+
+  // Cập nhật trạng thái Viewmode trên toàn bộ 4 camera & thanh taskbar
+  function updateViewmodeUI() {
+    const taskbarBtn = document.getElementById('ado-viewmode-btn');
+
+    if (!isViewmodeActive) {
+      CAM_NAMES.forEach(camName => renderCameraViewmodeState(camName, false));
+      if (taskbarBtn) {
+        taskbarBtn.style.backgroundColor = 'rgba(148, 163, 184, 0.15)';
+        taskbarBtn.style.borderColor = 'rgba(148, 163, 184, 0.4)';
+        taskbarBtn.style.color = '#94a3b8';
+        taskbarBtn.innerHTML = `<span>👁️</span><span>Viewmode [~]</span>`;
+      }
+      return;
+    }
+
+    const boxSelected = isBoxSelected();
+    const boxId = boxSelected ? (findCurrentActiveBoxId() || 'active') : null;
+
+    if (!boxSelected) {
+      CAM_NAMES.forEach(camName => renderCameraViewmodeState(camName, false));
+      if (taskbarBtn) {
+        taskbarBtn.style.backgroundColor = 'rgba(234, 179, 8, 0.2)';
+        taskbarBtn.style.borderColor = 'rgba(234, 179, 8, 0.6)';
+        taskbarBtn.style.color = '#fde047';
+        taskbarBtn.innerHTML = `<span>👁️</span><span>Viewmode [Chưa chọn box]</span>`;
+      }
+      return;
+    }
+
+    let activeCams = viewmodeBoxCamMap.get(boxId);
+    if (!activeCams) {
+      activeCams = autoDetectCamerasForBox();
+      viewmodeBoxCamMap.set(boxId, activeCams);
+    }
+
+    CAM_NAMES.forEach(camName => {
+      renderCameraViewmodeState(camName, activeCams.has(camName));
+    });
+
+    if (taskbarBtn) {
+      taskbarBtn.style.backgroundColor = 'rgba(16, 185, 129, 0.25)';
+      taskbarBtn.style.borderColor = '#10b981';
+      taskbarBtn.style.color = '#6ee7b7';
+      const camListStr = activeCams.size > 0 ? Array.from(activeCams).join(', ') : 'Không có cam';
+      taskbarBtn.innerHTML = `<span>👁️</span><span>Viewmode: #${boxId} [${camListStr}]</span>`;
+    }
+  }
+
+  // Bật/Tắt Viewmode (Luôn quét mới 100% khi bật lại)
+  function toggleViewmode() {
+    isViewmodeActive = !isViewmodeActive;
+
+    if (isViewmodeActive) {
+      if (!isBoxSelected()) {
+        showToast("⚠️ Đã bật Viewmode! Hãy click chọn 1 box trong LiDAR 3D để nhận diện camera.");
+      } else {
+        const boxId = findCurrentActiveBoxId() || 'active';
+        // Luôn luôn xóa cache cũ và quét mới 100% theo vị trí hiện tại của box!
+        const activeCams = autoDetectCamerasForBox();
+        viewmodeBoxCamMap.set(boxId, activeCams);
+        const camStr = activeCams.size > 0 ? Array.from(activeCams).join(', ') : 'Không nằm trong cam nào';
+        showToast(`👁️ <b>Viewmode BẬT</b>: Box #${boxId} tại <b>[${camStr}]</b>`);
+      }
+    } else {
+      showToast("👁️ Đã <b>TẮT</b> Viewmode.");
+      if (quickTOModalEl) quickTOModalEl.style.display = 'none';
+    }
+
+    updateViewmodeUI();
+  }
+
+  // Tự động cập nhật khi đổi sang box khác trong chế độ Viewmode
+  setInterval(() => {
+    if (isViewmodeActive) {
+      const curId = findCurrentActiveBoxId();
+      if (curId !== lastViewmodeBoxId) {
+        lastViewmodeBoxId = curId;
+        if (curId) {
+          const fresh = autoDetectCamerasForBox();
+          viewmodeBoxCamMap.set(curId, fresh);
+        }
+        updateViewmodeUI();
+        if (quickTOModalEl && quickTOModalEl.style.display !== 'none') {
+          populateQuickTOModal();
+        }
+      }
+    }
+  }, 300);
+
+  // =========================================================================
+  // 13.6. FLOATING QUICK T/O EDITOR (MIDDLE-CLICK OR COMMA KEY ,)
+  // =========================================================================
+
+  let quickTOModalEl = null;
+
+  // Kiểm tra xem box có nằm sát rìa ảnh hoặc sát rìa lens mắt cá hay không
+  function isBoxNearCameraEdge(camName, curBoxId) {
+    const cam = getCameraElements(camName);
+    if (!cam || !cam.svg) return false;
+
+    let targetPolylines = [];
+    if (curBoxId) {
+      const textEls = Array.from(cam.svg.querySelectorAll('text'));
+      const matchedText = textEls.find(t => (t.textContent || '').trim() === String(curBoxId));
+      if (matchedText) {
+        const g = matchedText.closest('g');
+        if (g) targetPolylines = Array.from(g.querySelectorAll('polyline'));
+      }
+    }
+
+    if (targetPolylines.length === 0) {
+      targetPolylines = Array.from(cam.svg.querySelectorAll('polyline[stroke="#ffff00"]'));
+    }
+
+    if (targetPolylines.length === 0) return false;
+
+    const centerX = 912;
+    const centerY = 768;
+    const lensRadiusThreshold = 680; // Khoảng cách tới tâm > 680 là sát rìa lens tròn
+
+    for (const poly of targetPolylines) {
+      const ptsAttr = poly.getAttribute('points');
+      if (!ptsAttr) continue;
+      const coords = ptsAttr.trim().split(/[\s,]+/);
+      for (let i = 0; i < coords.length - 1; i += 2) {
+        const x = parseFloat(coords[i]);
+        const y = parseFloat(coords[i + 1]);
+        if (isNaN(x) || isNaN(y)) continue;
+
+        // 1. Sát rìa khung ảnh chữ nhật (cách viền < 50px hoặc vượt ra ngoài)
+        if (x <= 50 || x >= 1774 || y <= 50 || y >= 1486) {
+          return true;
+        }
+
+        // 2. Sát rìa vòng tròn ống kính mắt cá fisheye
+        const dist = Math.sqrt((x - centerX) * (x - centerX) + (y - centerY) * (y - centerY));
+        if (dist >= lensRadiusThreshold) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  // Đồng bộ giá trị T/O từ bảng nổi vào web ADO (vào đúng thẻ input trong sidebar)
+  function syncQuickTOValue(camKey, type, val) {
+    const strVal = String(val);
+    const inputs = getCameraAttrInputs();
+    if (inputs && inputs[camKey]) {
+      const targetInput = type === 't' ? inputs[camKey].tInput : inputs[camKey].oInput;
+      if (targetInput) {
+        setRealReactInputValue(targetInput, strVal);
+      }
+    }
+  }
+
+  let quickTOMenuCustomPos = null;
+
+  // Tạo khung UI nổi Quick T/O Editor
+  // Kiểm tra xem camera có đang bị ẩn box 2D (\uC228\uAE40) hay không
+  function isCamForciblyHidden(camName) {
+    const camLower = camName.toLowerCase();
+    const allLis = document.querySelectorAll('li');
+    for (const li of allLis) {
+      const textSpans = Array.from(li.querySelectorAll('span')).map(s => s.textContent.trim().toLowerCase());
+      if (textSpans.includes(camLower)) {
+        const hasBadge = Array.from(li.querySelectorAll('span')).some(s => s.textContent.trim() === '\uC228\uAE40' || s.textContent.trim().toLowerCase() === 'hidden');
+        const hasReprojectBtn = Array.from(li.querySelectorAll('button')).some(b => b.textContent.includes('\uC7AC\uD22C\uC601') || b.title?.includes('\uC7AC\uD22C\uC601'));
+        if (hasBadge || hasReprojectBtn) return true;
+      }
+    }
+    return false;
+  }
+
+  // Khôi phục lại box 2D từ 3D Cuboid (Reprojection [\uC7AC\uD22C\uC601])
+  async function reprojectCameraBox(camName) {
+    const camLower = camName.toLowerCase();
+    let clicked = false;
+    // Cách 1: Bấm trực tiếp nút [\uC7AC\uD22C\uC601] ở Camera 속성 bên sidebar
+    const allLis = document.querySelectorAll('li');
+    for (const li of allLis) {
+      const textSpans = Array.from(li.querySelectorAll('span')).map(s => s.textContent.trim().toLowerCase());
+      if (textSpans.includes(camLower)) {
+        const btn = Array.from(li.querySelectorAll('button')).find(b => b.textContent.includes('\uC7AC\uD22C\uC601') || b.title?.includes('\uC7AC\uD22C\uC601'));
+        if (btn) {
+          const origConfirm = window.confirm;
+          try {
+            window.confirm = () => true;
+            btn.click();
+            clicked = true;
+          } finally {
+            window.confirm = origConfirm;
+          }
+          break;
+        }
+      }
+    }
+    if (clicked) {
+      await new Promise(r => setTimeout(r, 60));
+      return true;
+    }
+
+    // Cách 2: Vào 2D box mode và gửi phím R
+    const cam = getCameraElements(camName);
+    if (cam && cam.container) {
+      cam.container.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window }));
+      await new Promise(r => setTimeout(r, 40));
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyR', key: 'r', keyCode: 82, which: 82, bubbles: true, cancelable: true }));
+      await new Promise(r => setTimeout(r, 40));
+      cam.container.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window }));
+      await new Promise(r => setTimeout(r, 40));
+      return true;
+    }
+    return false;
+  }
+
+  // Xóa box 2D cưỡng bức (Force Hide [\uC228\uAE40])
+  async function forceHideCameraBox(camName) {
+    const cam = getCameraElements(camName);
+    if (!cam || !cam.container) return false;
+
+    // Vào chế độ 2D Box của camera này
+    cam.container.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window }));
+    await new Promise(r => setTimeout(r, 40));
+
+    // Gửi phím B để xóa box 2D (l5 forceHide)
+    window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyB', key: 'b', keyCode: 66, which: 66, bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 40));
+
+    // Thoát chế độ 2D Box
+    cam.container.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, view: window }));
+    await new Promise(r => setTimeout(r, 40));
+
+    // Gán T=0 và O=0 cho camera này để đúng chuẩn gán nhãn khi xóa box 2D
+    const camKey = camName.toLowerCase();
+    syncQuickTOValue(camKey, 't', '0');
+    syncQuickTOValue(camKey, 'o', '0');
+
+    return true;
+  }
+
+  // Tạo khung UI nổi Quick T/O Editor
+  function createQuickTOModal() {
+    if (quickTOModalEl) return quickTOModalEl;
+
+    quickTOModalEl = document.createElement('div');
+    quickTOModalEl.id = 'ado-quick-to-modal';
+    Object.assign(quickTOModalEl.style, {
+      position: 'fixed',
+      zIndex: '10000045',
+      width: '360px',
+      backgroundColor: '#090d16',
+      border: '1px solid #334155',
+      borderRadius: '12px',
+      boxShadow: '0 20px 40px -10px rgba(0, 0, 0, 0.9), 0 0 1px 1px rgba(255, 255, 255, 0.08)',
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      color: '#e2e8f0',
+      display: 'none',
+      flexDirection: 'column',
+      overflow: 'hidden',
+      userSelect: 'none'
+    });
+
+    quickTOModalEl.innerHTML = `
+      <div id="ado-quick-to-header" style="display:flex; justify-content:space-between; align-items:center; padding:9px 14px; background:#0f172a; border-bottom:1px solid #1e293b; cursor:grab;">
+        <div style="display:flex; align-items:center; gap:6px;">
+          <span style="font-size:14px;">🎛️</span>
+          <span id="ado-quick-to-title" style="font-size:12.5px; font-weight:700; color:#f8fafc;">Camera T/O</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button id="ado-quick-to-close-btn" type="button" style="background:none; border:none; color:#94a3b8; font-size:16px; cursor:pointer; line-height:1; padding:0 3px;">✕</button>
+        </div>
+      </div>
+      <div id="ado-quick-to-body" style="padding:10px 12px; display:flex; flex-direction:column; gap:7px;">
+      </div>
+      <!-- BẢNG THÔNG SỐ QUY ƯỚC MỨC ĐỘ 0-4 (%) -->
+      <div style="padding:7px 12px; background:#0c1222; border-top:1px solid #1e293b; display:flex; flex-direction:column; gap:5px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:10px; font-weight:700; color:#94a3b8;">
+          <span>QUY ƯỚC MỨC ĐỘ T / O:</span>
+          <span style="font-size:9px; color:#64748b; font-weight:500;">(0 ~ 4)</span>
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:4px; text-align:center;">
+          <div style="background:#1e293b; padding:4px 1px; border-radius:5px; border:1px solid #334155;">
+            <div style="font-size:11px; font-weight:800; color:#38bdf8;">0</div>
+            <div style="font-size:8.5px; color:#cbd5e1; font-weight:600; white-space:nowrap;">0~5%</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 1px; border-radius:5px; border:1px solid #334155;">
+            <div style="font-size:11px; font-weight:800; color:#4ade80;">1</div>
+            <div style="font-size:8.5px; color:#cbd5e1; font-weight:600; white-space:nowrap;">5~20%</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 1px; border-radius:5px; border:1px solid #334155;">
+            <div style="font-size:11px; font-weight:800; color:#facc15;">2</div>
+            <div style="font-size:8.5px; color:#cbd5e1; font-weight:600; white-space:nowrap;">20~50%</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 1px; border-radius:5px; border:1px solid #334155;">
+            <div style="font-size:11px; font-weight:800; color:#fb923c;">3</div>
+            <div style="font-size:8.5px; color:#cbd5e1; font-weight:600; white-space:nowrap;">50~80%</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 1px; border-radius:5px; border:1px solid #334155;">
+            <div style="font-size:11px; font-weight:800; color:#f87171;">4</div>
+            <div style="font-size:8.5px; color:#cbd5e1; font-weight:600; white-space:nowrap;">80~100%</div>
+          </div>
+        </div>
+      </div>
+      <!-- THANH ĐIỀU KHIỂN HÀNH ĐỘNG -->
+      <div style="padding:7px 10px; background:#080d1a; border-top:1px solid #1e293b; display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; align-items:center; gap:5px; justify-content:space-between;">
+          <button id="ado-quick-to-set-zero-btn" type="button" style="display:flex; align-items:center; gap:3px; padding:3px 7px; border-radius:5px; background:rgba(234, 179, 8, 0.18); border:1px solid rgba(234, 179, 8, 0.55); color:#facc15; font-size:10px; font-weight:700; cursor:pointer; transition:all 0.15s ease;" title="Gán T=0 và O=0 cho các camera KHÔNG có box (giữ nguyên camera có box)">
+            <span>⚡</span><span>Set 0 Không Box</span>
+          </button>
+          <button id="ado-quick-to-del-2d-btn" type="button" style="display:flex; align-items:center; gap:3px; padding:3px 7px; border-radius:5px; background:rgba(244, 63, 94, 0.18); border:1px solid rgba(244, 63, 94, 0.55); color:#fda4af; font-size:10px; font-weight:700; cursor:pointer; transition:all 0.15s ease;" title="Xóa box 2D (Force Hide [\uC228\uAE40]) cho các camera được tick">
+            <span>🗑️</span><span>Xóa 2D (Tick)</span>
+          </button>
+          <button id="ado-quick-to-restore-2d-btn" type="button" style="display:flex; align-items:center; gap:3px; padding:3px 7px; border-radius:5px; background:rgba(56, 189, 248, 0.18); border:1px solid rgba(56, 189, 248, 0.55); color:#7dd3fc; font-size:10px; font-weight:700; cursor:pointer; transition:all 0.15s ease;" title="Khôi phục lại box 2D (Reproject [\uC7AC\uD22C\uC601]) cho các camera được tick">
+            <span>🔄</span><span>Khôi Phục (Tick)</span>
+          </button>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:9px; color:#64748b; padding:0 2px;">
+          <span>Tick cam để Xóa / Khôi phục 2D</span>
+          <span>Lăn chuột: 0-4 | Esc: Đóng</span>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(quickTOModalEl);
+
+    // Nút đóng
+    const closeBtn = quickTOModalEl.querySelector('#ado-quick-to-close-btn');
+    closeBtn.onclick = () => { quickTOModalEl.style.display = 'none'; };
+
+    // Kéo thả header di chuyển bảng nổi
+    let isDraggingModal = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let modalStartX = 0;
+    let modalStartY = 0;
+
+    const header = quickTOModalEl.querySelector('#ado-quick-to-header');
+    header.addEventListener('mousedown', (e) => {
+      if (e.target === closeBtn) return;
+      isDraggingModal = true;
+      header.style.cursor = 'grabbing';
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      modalStartX = quickTOModalEl.offsetLeft;
+      modalStartY = quickTOModalEl.offsetTop;
+
+      const onMouseMove = (ev) => {
+        if (!isDraggingModal) return;
+        const dx = ev.clientX - dragStartX;
+        const dy = ev.clientY - dragStartY;
+        quickTOModalEl.style.left = `${modalStartX + dx}px`;
+        quickTOModalEl.style.top = `${modalStartY + dy}px`;
+      };
+
+      const onMouseUp = () => {
+        isDraggingModal = false;
+        header.style.cursor = 'grab';
+        quickTOMenuCustomPos = {
+          left: quickTOModalEl.style.left,
+          top: quickTOModalEl.style.top
+        };
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
+
+    // 1. Nút Set 0 Cam Không Box
+    const setZeroBtn = quickTOModalEl.querySelector('#ado-quick-to-set-zero-btn');
+    if (setZeroBtn) {
+      setZeroBtn.onclick = () => {
+        const currentBoxId = findCurrentActiveBoxId() || 'active';
+        let activeCams = viewmodeBoxCamMap.get(currentBoxId);
+        if (!activeCams) activeCams = autoDetectCamerasForBox();
+
+        let modifiedCount = 0;
+        CAM_NAMES.forEach(cName => {
+          if (!activeCams.has(cName)) {
+            const cKey = cName.toLowerCase();
+            syncQuickTOValue(camKey, 't', '0');
+            syncQuickTOValue(camKey, 'o', '0');
+            modifiedCount++;
+          }
+        });
+        populateQuickTOModal();
+        showToast(`⚡ Đã gán T/O = 0 cho ${modifiedCount} camera không có box!`);
+      };
+    }
+
+    // 2. Nút Xóa Box 2D (Tick)
+    const del2DBtn = quickTOModalEl.querySelector('#ado-quick-to-del-2d-btn');
+    if (del2DBtn) {
+      del2DBtn.onclick = async () => {
+        const checkedBoxes = Array.from(quickTOModalEl.querySelectorAll('.ado-cam-tick:checked'));
+        if (checkedBoxes.length === 0) {
+          showToast("⚠️ Hãy tick chọn ít nhất 1 camera để xóa box 2D!");
+          return;
+        }
+        const cams = checkedBoxes.map(cb => cb.dataset.cam);
+        del2DBtn.disabled = true;
+        del2DBtn.style.opacity = '0.5';
+        showToast(`🗑️ Đang xóa box 2D cho ${cams.join(', ')}...`);
+        for (const c of cams) {
+          await forceHideCameraBox(c);
+        }
+        del2DBtn.disabled = false;
+        del2DBtn.style.opacity = '1';
+        populateQuickTOModal();
+        showToast(`✅ Đã xóa box 2D [\uC228\uAE40] cho ${cams.join(', ')}!`);
+      };
+    }
+
+    // 3. Nút Khôi Phục Box 2D (Tick)
+    const restore2DBtn = quickTOModalEl.querySelector('#ado-quick-to-restore-2d-btn');
+    if (restore2DBtn) {
+      restore2DBtn.onclick = async () => {
+        const checkedBoxes = Array.from(quickTOModalEl.querySelectorAll('.ado-cam-tick:checked'));
+        if (checkedBoxes.length === 0) {
+          showToast("⚠️ Hãy tick chọn ít nhất 1 camera để khôi phục box 2D!");
+          return;
+        }
+        const cams = checkedBoxes.map(cb => cb.dataset.cam);
+        restore2DBtn.disabled = true;
+        restore2DBtn.style.opacity = '0.5';
+        showToast(`🔄 Đang khôi phục box 2D cho ${cams.join(', ')}...`);
+        for (const c of cams) {
+          await reprojectCameraBox(c);
+        }
+        restore2DBtn.disabled = false;
+        restore2DBtn.style.opacity = '1';
+        populateQuickTOModal();
+        showToast(`✅ Đã khôi phục box 2D [\uC7AC\uD22C\uC601] cho ${cams.join(', ')}!`);
+      };
+    }
+
+    return quickTOModalEl;
+  }
+
+  // Render nội dung bảng Quick T/O theo box đang chọn
+  function populateQuickTOModal() {
+    const modal = createQuickTOModal();
+    const boxId = findCurrentActiveBoxId() || 'active';
+    const titleEl = modal.querySelector('#ado-quick-to-title');
+    if (titleEl) {
+      titleEl.innerHTML = `Camera T/O &mdash; <b style="color:#fbbf24;">#${boxId}</b>`;
+    }
+
+    const bodyEl = modal.querySelector('#ado-quick-to-body');
+    bodyEl.innerHTML = '';
+
+    // Lấy camera được chọn hiện tại cho box
+    let activeCams = viewmodeBoxCamMap.get(boxId);
+    if (!activeCams) {
+      activeCams = autoDetectCamerasForBox();
+      viewmodeBoxCamMap.set(boxId, activeCams);
+    }
+
+    // Đọc giá trị hiện tại từ web
+    const currentWebAttrs = readCameraAttrs() || {};
+
+    CAM_NAMES.forEach(camName => {
+      const camKey = camName.toLowerCase();
+      const hasBox = activeCams.has(camName);
+      const isHidden = isCamForciblyHidden(camName);
+      const isNearEdge = hasBox && !isHidden && isBoxNearCameraEdge(camName, boxId);
+
+      // Lấy giá trị ban đầu, nếu trống hoặc '-' thì mặc định = 0!
+      let initT = currentWebAttrs[camKey]?.t;
+      let initO = currentWebAttrs[camKey]?.o;
+
+      if (!hasBox || isHidden) {
+        initT = (initT === '' || initT === null || initT === undefined || initT === '—' || initT === '-') ? '0' : initT;
+        initO = (initO === '' || initO === null || initO === undefined || initO === '—' || initO === '-') ? '0' : initO;
+      } else {
+        if (initT === '' || initT === null || initT === undefined || initT === '—' || initT === '-') {
+          initT = '0';
+          syncQuickTOValue(camKey, 't', '0');
+        }
+        if (initO === '' || initO === null || initO === undefined || initO === '—' || initO === '-') {
+          initO = '0';
+          syncQuickTOValue(camKey, 'o', '0');
+        }
+      }
+
+      const row = document.createElement('div');
+      Object.assign(row.style, {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '5px 8px',
+        borderRadius: '8px',
+        backgroundColor: hasBox && !isHidden ? 'rgba(30, 41, 59, 0.4)' : 'rgba(15, 23, 42, 0.45)',
+        border: hasBox && !isHidden ? '1px solid #334155' : '1px dashed rgba(71, 85, 105, 0.6)',
+        opacity: '1',
+        transition: 'all 0.15s ease'
+      });
+
+      // 1. Cột Tên camera + Badge
+      const nameCol = document.createElement('div');
+      nameCol.style.display = 'flex';
+      nameCol.style.alignItems = 'center';
+      nameCol.style.gap = '5px';
+      nameCol.style.width = '82px';
+
+      let statusBadge = '';
+      if (isHidden) {
+        statusBadge = `<span style="font-size:8px; color:#fda4af; background:rgba(225, 29, 72, 0.25); border:1px solid rgba(244, 63, 94, 0.45); padding:1px 3px; border-radius:3px; font-weight:700;" title="Box 2D đã bị ẩn cưỡng bức (숨김)">숨김</span>`;
+      } else if (hasBox) {
+        statusBadge = `<span style="font-size:9px; color:#34d399;" title="Box xuất hiện trên camera này">●</span>`;
+      } else {
+        statusBadge = `<span style="font-size:8px; color:#64748b; background:#1e293b; padding:1px 4px; border-radius:3px; font-weight:600;" title="Không phát hiện box">No Box</span>`;
+      }
+
+      nameCol.innerHTML = `
+        <span style="font-size:11.5px; font-weight:700; color:${hasBox && !isHidden ? '#f1f5f9' : '#94a3b8'};">${camName}</span>
+        ${statusBadge}
+      `;
+      row.appendChild(nameCol);
+
+      // 2. Cột nhập T và O
+      const inputsContainer = document.createElement('div');
+      inputsContainer.style.display = 'flex';
+      inputsContainer.style.alignItems = 'center';
+      inputsContainer.style.gap = '8px';
+
+      // 1. Ô T (Truncation)
+      const tGroup = document.createElement('div');
+      tGroup.style.display = 'flex';
+      tGroup.style.alignItems = 'center';
+      tGroup.style.gap = '4px';
+
+      const tLabel = document.createElement('span');
+      tLabel.textContent = 'T';
+      tLabel.style.fontSize = '10.5px';
+      tLabel.style.fontWeight = '700';
+      tLabel.style.color = isNearEdge ? '#f87171' : '#94a3b8';
+      tGroup.appendChild(tLabel);
+
+      const tInput = document.createElement('input');
+      tInput.type = 'text';
+      tInput.inputMode = 'numeric';
+      tInput.value = initT;
+      tInput.disabled = false;
+      Object.assign(tInput.style, {
+        width: '36px',
+        height: '25px',
+        textAlign: 'center',
+        fontFamily: 'ui-monospace, monospace',
+        fontSize: '12px',
+        fontWeight: '700',
+        borderRadius: '6px',
+        outline: 'none',
+        transition: 'all 0.15s ease',
+        cursor: 'pointer',
+        boxSizing: 'border-box'
+      });
+
+      if (isNearEdge) {
+        tInput.style.backgroundColor = '#dc2626';
+        tInput.style.border = '1.5px solid #ef4444';
+        tInput.style.color = '#ffffff';
+        tInput.style.boxShadow = '0 0 10px rgba(239, 68, 68, 0.75)';
+        tInput.title = '⚠️ CẢNH BÁO: Box nằm sát rìa ảnh/lens camera (khả năng bị cắt - Truncation)! Lăn chuột đổi số (0-4)';
+      } else if (!hasBox || isHidden) {
+        tInput.style.backgroundColor = '#111827';
+        tInput.style.border = '1px dashed #64748b';
+        tInput.style.color = '#94a3b8';
+        tInput.title = 'Cam này không có box hoặc đã bị ẩn (vẫn lăn chuột đổi số được)';
+      } else {
+        tInput.style.backgroundColor = '#0b0f19';
+        tInput.style.border = '1px solid #334155';
+        tInput.style.color = '#f8fafc';
+        tInput.title = 'Lăn chuột để đổi số T (0-4)';
+      }
+
+      tGroup.appendChild(tInput);
+      inputsContainer.appendChild(tGroup);
+
+      // 2. Ô O (Occlusion)
+      const oGroup = document.createElement('div');
+      oGroup.style.display = 'flex';
+      oGroup.style.alignItems = 'center';
+      oGroup.style.gap = '4px';
+
+      const oLabel = document.createElement('span');
+      oLabel.textContent = 'O';
+      oLabel.style.fontSize = '10.5px';
+      oLabel.style.fontWeight = '700';
+      oLabel.style.color = '#94a3b8';
+      oGroup.appendChild(oLabel);
+
+      const oInput = document.createElement('input');
+      oInput.type = 'text';
+      oInput.inputMode = 'numeric';
+      oInput.value = initO;
+      oInput.disabled = false;
+      Object.assign(oInput.style, {
+        width: '36px',
+        height: '25px',
+        textAlign: 'center',
+        fontFamily: 'ui-monospace, monospace',
+        fontSize: '12px',
+        fontWeight: '700',
+        borderRadius: '6px',
+        backgroundColor: hasBox && !isHidden ? '#0b0f19' : '#111827',
+        border: hasBox && !isHidden ? '1px solid #334155' : '1px dashed #64748b',
+        color: hasBox && !isHidden ? '#f8fafc' : '#94a3b8',
+        outline: 'none',
+        transition: 'all 0.15s ease',
+        cursor: 'pointer',
+        boxSizing: 'border-box'
+      });
+      oInput.title = hasBox && !isHidden ? 'Lăn chuột để đổi số O (0-4)' : 'Cam này không có box hoặc đã bị ẩn (vẫn lăn chuột đổi số được)';
+
+      oGroup.appendChild(oInput);
+      inputsContainer.appendChild(oGroup);
+
+      // Gắn sự kiện lăn chuột đổi số 0-4 và gõ phím cho TẤT CẢ các camera
+      const bindWheelAndInput = (inputEl, type) => {
+        inputEl.addEventListener('wheel', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          let cur = parseInt(inputEl.value, 10);
+          if (isNaN(cur)) cur = 0;
+          if (e.deltaY < 0) {
+            if (cur < 4) cur++;
+          } else if (e.deltaY > 0) {
+            if (cur > 0) cur--;
+          }
+          inputEl.value = String(cur);
+          syncQuickTOValue(camKey, type, cur);
+        }, { passive: false });
+
+        inputEl.addEventListener('input', () => {
+          let v = parseInt(inputEl.value.trim(), 10);
+          if (isNaN(v) || v < 0) v = 0;
+          if (v > 4) v = 4;
+          inputEl.value = String(v);
+          syncQuickTOValue(camKey, type, v);
+        });
+
+        inputEl.addEventListener('keydown', (e) => {
+          if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            let cur = Math.min(4, (parseInt(inputEl.value, 10) || 0) + 1);
+            inputEl.value = String(cur);
+            syncQuickTOValue(camKey, type, cur);
+          } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            let cur = Math.max(0, (parseInt(inputEl.value, 10) || 0) - 1);
+            inputEl.value = String(cur);
+            syncQuickTOValue(camKey, type, cur);
+          }
+        });
+      };
+
+      bindWheelAndInput(tInput, 't');
+      bindWheelAndInput(oInput, 'o');
+
+      row.appendChild(inputsContainer);
+
+      // 3. Cột Tick chọn để Xóa / Khôi phục 2D (Tự động bỏ tick khi đổi box)
+      const tickCol = document.createElement('div');
+      tickCol.style.display = 'flex';
+      tickCol.style.alignItems = 'center';
+      tickCol.style.justifyContent = 'center';
+      tickCol.style.marginLeft = '4px';
+
+      const tickBox = document.createElement('input');
+      tickBox.type = 'checkbox';
+      tickBox.className = 'ado-cam-tick';
+      tickBox.dataset.cam = camName;
+      tickBox.checked = false; // Luôn luôn mặc định bỏ tick khi mở hoặc đổi box
+      Object.assign(tickBox.style, {
+        width: '16px',
+        height: '16px',
+        cursor: 'pointer',
+        accentColor: '#38bdf8',
+        margin: '0',
+        borderRadius: '3px'
+      });
+      tickBox.title = `Tick chọn camera ${camName} để Xóa hoặc Khôi phục box 2D`;
+      tickCol.appendChild(tickBox);
+      row.appendChild(tickCol);
+
+      bodyEl.appendChild(row);
+    });
+  }
+  function openQuickTOModal() {
+    if (!isViewmodeActive) {
+      showToast("⚠️ Hãy bật <b>Viewmode [~]</b> trước để mở bảng T/O nhanh!");
+      return;
+    }
+    if (!isBoxSelected()) {
+      showToast("⚠️ Chưa chọn box! Hãy click chọn 1 box trong LiDAR 3D trước.");
+      return;
+    }
+
+    const modal = createQuickTOModal();
+    populateQuickTOModal();
+
+    if (quickTOMenuCustomPos) {
+      modal.style.left = quickTOMenuCustomPos.left;
+      modal.style.top = quickTOMenuCustomPos.top;
+    } else {
+      // Mặc định luôn đặt sang bên trái (khung LiDAR) để hoàn toàn không che 4 camera 2D bên phải!
+      modal.style.left = '24px';
+      modal.style.top = '110px';
+    }
+
+    modal.style.display = 'flex';
+  }
+
+  function toggleQuickTOModal() {
+    const modal = document.getElementById('ado-quick-to-modal');
+    if (modal && modal.style.display !== 'none') {
+      modal.style.display = 'none';
+    } else {
+      openQuickTOModal();
+    }
+  }
+
+  // Lắng nghe chuột giữa trên vùng 4 camera 2D
+  window.addEventListener('mousedown', (e) => {
+    if (!isViewmodeActive) return;
+    if (e.button === 1) { // Chuột giữa (Wheel click)
+      const target = e.target;
+      const isInside2D = target.closest('img[alt="FRONT"], img[alt="REAR"], img[alt="LEFT"], img[alt="RIGHT"]') ||
+        target.closest('.ado-cam-toggle-btn') ||
+        target.closest('svg') ||
+        CAM_NAMES.some(c => {
+          const cam = getCameraElements(c);
+          return cam && cam.container && (cam.container === target || cam.container.contains(target));
+        });
+
+      if (isInside2D) {
+        e.preventDefault();
+        e.stopPropagation();
+        openQuickTOModal();
+      }
+    }
+  }, true);
+
+  window.addEventListener('auxclick', (e) => {
+    if (!isViewmodeActive) return;
+    if (e.button === 1) {
+      const target = e.target;
+      const isInside2D = target.closest('img[alt="FRONT"], img[alt="REAR"], img[alt="LEFT"], img[alt="RIGHT"]') ||
+        target.closest('svg') ||
+        CAM_NAMES.some(c => {
+          const cam = getCameraElements(c);
+          return cam && cam.container && (cam.container === target || cam.container.contains(target));
+        });
+      if (isInside2D) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+  }, true);
+
+
+  function recordActiveBoxCamAttrs() {
+    const boxId = findCurrentActiveBoxId();
+    if (boxId) {
+      const attrs = readCameraAttrs();
+      if (attrs) {
+        const hasVal = Object.values(attrs).some(c => (c.t !== '' && c.t !== null) || (c.o !== '' && c.o !== null));
+        if (hasVal) {
+          camAttrCacheById.set(boxId, attrs);
+          try {
+            let stored = JSON.parse(localStorage.getItem('ado_temp_cam_attrs') || '{}');
+            stored[boxId] = attrs;
+            localStorage.setItem('ado_temp_cam_attrs', JSON.stringify(stored));
+          } catch (err) {}
+        }
+      }
+    }
+  }
+
+  document.addEventListener('input', recordActiveBoxCamAttrs, true);
+  document.addEventListener('change', recordActiveBoxCamAttrs, true);
+  document.addEventListener('click', () => setTimeout(recordActiveBoxCamAttrs, 100), true);
+
+  // Network hook to cache frame data from fetch
+  try {
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const res = await origFetch.apply(this, args);
+      try {
+        const clone = res.clone();
+        clone.json().then(data => {
+          const scan = (obj) => {
+            if (!obj) return;
+            if (Array.isArray(obj)) {
+              obj.forEach(scan);
+            } else if (typeof obj === 'object') {
+              const id = obj.id ?? obj.tracking_id ?? obj.object_id ?? obj.obj_id;
+              const props = obj.camera_properties ?? obj.camera_attributes ?? obj.cameraAttributes ?? obj.cameraProps;
+              if (id !== undefined && props && typeof props === 'object') {
+                const map = {};
+                for (const cam of ['front', 'rear', 'left', 'right']) {
+                  if (props[cam]) {
+                    const t = props[cam].truncation ?? props[cam].t;
+                    const o = props[cam].occlusion ?? props[cam].o;
+                    map[cam] = {
+                      t: t !== undefined && t !== null ? String(t) : '',
+                      o: o !== undefined && o !== null ? String(o) : ''
+                    };
+                  }
+                }
+                if (Object.keys(map).length > 0) {
+                  camAttrCacheById.set(String(id), map);
+                  try {
+                    let stored = JSON.parse(localStorage.getItem('ado_temp_cam_attrs') || '{}');
+                    stored[String(id)] = map;
+                    localStorage.setItem('ado_temp_cam_attrs', JSON.stringify(stored));
+                  } catch (err) {}
+                }
+              }
+              if (Array.isArray(obj.annotations)) obj.annotations.forEach(scan);
+              if (Array.isArray(obj.objects)) obj.objects.forEach(scan);
+              if (Array.isArray(obj.cuboids)) obj.cuboids.forEach(scan);
+              if (Array.isArray(obj.boxes)) obj.boxes.forEach(scan);
+            }
+          };
+          scan(data);
+        }).catch(() => {});
+      } catch (e) {}
+      return res;
+    };
+  } catch (e) {}
+
+  function downloadJson(data, filename = 'ado_saved_cam_attrs.json') {
+    try {
+      const jsonStr = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) a.parentNode.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 200);
+    } catch (e) {
+      console.error('Error downloading JSON:', e);
+    }
+  }
+
+  function getAllObjectButtons() {
+    const aside = document.querySelector('aside') || document.body;
+    const items = [];
+    const seenIds = new Set();
+
+    // 1. Tìm tất cả các button dòng đối tượng có chứa số ID font-mono (chuẩn cấu trúc ALCHERA ADO)
+    const allButtons = Array.from(aside.querySelectorAll('button'));
+    for (const btn of allButtons) {
+      const mono = btn.querySelector('.font-mono');
+      if (mono && /^\d+$/.test(mono.textContent.trim())) {
+        const id = mono.textContent.trim();
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          items.push({ id, element: btn, button: btn });
+        }
+      }
+    }
+
+    // 2. Dự phòng: Quét theo các Category
+    if (items.length === 0) {
+      const CLASS_NAMES = ['VEHICLE', 'Unspecified', 'PEDESTRIAN', 'CYCLIST', 'STATIC', 'TRAFFIC_CONE', 'BARRIER'];
+      const candidates = Array.from(aside.querySelectorAll('div, button, li')).filter(el => {
+        if (el.children.length > 8 || el.children.length === 0) return false;
+        const t = el.textContent || '';
+        if (t.includes('Object (') || t.includes('객체 (')) return false;
+        return CLASS_NAMES.some(c => t.includes(c)) && /\b\d+\b/.test(t);
+      });
+      for (const el of candidates) {
+        const txt = el.textContent.trim();
+        const m = txt.match(/^(\d+)/) || txt.match(/\b(\d+)\s+(Unspecified|VEHICLE|PEDESTRIAN|CYCLIST|STATIC)/i);
+        if (m && !seenIds.has(m[1])) {
+          let row = el.closest('button') || el.closest('.cursor-pointer') || el;
+          seenIds.add(m[1]);
+          items.push({ id: m[1], element: row, button: row });
+        }
+      }
+    }
+
+    return items;
+  }
+
+  function getUnenteredBoxItems() {
+    const aside = document.querySelector('aside') || document.body;
+    const unentered = [];
+    const seenIds = new Set();
+
+    // Tìm tất cả các badge cảnh báo T/O chưa nhập (title="truncation/occlusion 미입력" hoặc text="T/O")
+    const allSpans = Array.from(aside.querySelectorAll('span'));
+    const warningSpans = allSpans.filter(s => {
+      const title = s.getAttribute('title') || '';
+      return title.includes('미입력') || title.includes('truncation') || title.includes('occlusion') || (s.children.length === 0 && s.textContent.trim() === 'T/O');
+    });
+
+    for (const badge of warningSpans) {
+      const btn = badge.closest('button');
+      if (btn) {
+        const mono = btn.querySelector('.font-mono') || btn.querySelector('span');
+        const m = (mono ? mono.textContent.trim() : btn.textContent.trim()).match(/\b(\d+)\b/);
+        if (m && !seenIds.has(m[1])) {
+          seenIds.add(m[1]);
+          unentered.push({ id: m[1], element: btn, button: btn });
+        }
+      }
+    }
+
+    return unentered;
+  }
+
+  function getObjectListItems() {
+    return getAllObjectButtons();
+  }
+
+  async function selectBoxItem(item) {
+    if (!item || !item.element) return;
+    try {
+      item.element.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    } catch (e) {}
+
+    // Click đơn vào dòng để chuyển sang box này
+    item.element.click();
+
+    // Chờ tối đa 250ms cho React cập nhật giao diện đúng ID box này
+    for (let w = 0; w < 5; w++) {
+      const curId = findCurrentActiveBoxId();
+      if (curId === item.id) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+
+  function extractDirectFromReact() {
+    const allSpans = Array.from(document.querySelectorAll('span'));
+    const objHeader = allSpans.find(s => s.textContent && (s.textContent.includes('Object (') || s.textContent.includes('객체 (')));
+    const startEl = objHeader ? (objHeader.closest('button') || objHeader) : document.querySelector('aside') || document.body;
+
+    const fiberKey = Object.keys(startEl).find(k => k.startsWith('__reactFiber$'));
+    if (!fiberKey) return null;
+
+    let fiber = startEl[fiberKey];
+    let depth = 0;
+    while (fiber && depth < 40) {
+      if (fiber.memoizedProps) {
+        for (const [k, v] of Object.entries(fiber.memoizedProps)) {
+          if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object' && v[0] !== null) {
+            if (v[0].id !== undefined || v[0].tracking_id !== undefined || v[0].camera_properties || v[0].cameraAttributes) {
+              return v;
+            }
+          }
+        }
+      }
+      let s = fiber.memoizedState;
+      while (s) {
+        if (s.memoizedState) {
+          const val = s.memoizedState;
+          if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object' && val[0] !== null) {
+            if (val[0].id !== undefined || val[0].tracking_id !== undefined || val[0].camera_properties || val[0].cameraAttributes) {
+              return val;
+            }
+          }
+        }
+        s = s.next;
+      }
+      fiber = fiber.return;
+      depth++;
+    }
+    return null;
+  }
+
+  let inspectionModalEl = null;
+
+  function showCamAttrsInspectionModal(data, sourceTitle = 'Quét T/O') {
+    if (!inspectionModalEl) {
+      inspectionModalEl = document.createElement('div');
+      inspectionModalEl.id = 'ado-inspection-modal';
+      Object.assign(inspectionModalEl.style, {
+        position: 'fixed',
+        inset: '0',
+        zIndex: '10000070',
+        backgroundColor: 'rgba(2, 6, 23, 0.8)',
+        backdropFilter: 'blur(5px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '20px',
+        fontFamily: 'Inter, system-ui, -apple-system, sans-serif'
+      });
+      document.body.appendChild(inspectionModalEl);
+    }
+
+    const ids = Object.keys(data || {});
+    let validCount = 0;
+    let missingCount = 0;
+    const rowsInfo = [];
+
+    for (const id of ids) {
+      const item = data[id] || {};
+      let isComplete = true;
+      const camReport = {};
+
+      for (const cam of ['front', 'rear', 'left', 'right']) {
+        const tVal = item[cam]?.t;
+        const oVal = item[cam]?.o;
+        const tMissing = tVal === '' || tVal === null || tVal === undefined || tVal === '—' || tVal === '-';
+        const oMissing = oVal === '' || oVal === null || oVal === undefined || oVal === '—' || oVal === '-';
+
+        if (tMissing || oMissing) {
+          isComplete = false;
+        }
+
+        camReport[cam] = {
+          t: (tVal !== undefined && tVal !== null && tVal !== '') ? tVal : '—',
+          o: (oVal !== undefined && oVal !== null && oVal !== '') ? oVal : '—',
+          tMissing,
+          oMissing
+        };
+      }
+
+      if (isComplete) validCount++;
+      else missingCount++;
+
+      rowsInfo.push({ id, isComplete, camReport, isMismatch: false, mismatchCams: new Set() });
+    }
+
+    // Sort: xe thiếu chỉ số lên đầu danh sách để đập ngay vào mắt
+    rowsInfo.sort((a, b) => {
+      if (a.isComplete === b.isComplete) {
+        return Number(a.id) - Number(b.id);
+      }
+      return a.isComplete ? 1 : -1;
+    });
+
+    const card = document.createElement('div');
+    Object.assign(card.style, {
+      backgroundColor: '#0f172a',
+      border: '1px solid #334155',
+      borderRadius: '12px',
+      width: '95%',
+      maxWidth: '860px',
+      maxHeight: '85vh',
+      display: 'flex',
+      flexDirection: 'column',
+      boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.75)',
+      overflow: 'hidden'
+    });
+
+    card.innerHTML = `
+      <div style="padding: 14px 20px; border-bottom: 1px solid #334155; display:flex; justify-content:space-between; align-items:center; background:#1e293b;">
+        <div>
+          <div style="font-size:15px; font-weight:700; color:#f8fafc; display:flex; align-items:center; gap:8px;">
+            <span>📋</span>
+            <span>BẢNG KIỂM SOÁT THUỘC TÍNH T/O (${sourceTitle})</span>
+          </div>
+          <div style="font-size:12px; color:#94a3b8; margin-top:3px;">
+            Tổng số: <b style="color:#f8fafc;">${ids.length}</b> xe &nbsp;|&nbsp;
+            Đầy đủ: <b style="color:#4ade80;">${validCount}</b> xe &nbsp;|&nbsp;
+            Thiếu chỉ số: <b style="color:${missingCount > 0 ? '#ef4444' : '#94a3b8'};">${missingCount}</b> xe
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <button id="ado-check-diff-btn" type="button" style="display:flex; align-items:center; gap:5px; padding:5px 12px; background:#2563eb; border:1px solid #3b82f6; color:#fff; border-radius:6px; font-weight:700; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            <span>🔍</span><span>Kiểm Tra (Check)</span>
+          </button>
+          <button id="ado-modal-clear-btn" type="button" style="display:flex; align-items:center; gap:5px; padding:5px 12px; background:rgba(239, 68, 68, 0.18); border:1px solid rgba(239, 68, 68, 0.5); color:#fca5a5; border-radius:6px; font-weight:600; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            <span>🗑️</span><span>Xóa Lưu Tạm</span>
+          </button>
+          <button id="ado-close-inspect-btn" type="button" style="background:#334155; border:none; color:#cbd5e1; width:28px; height:28px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:14px; display:flex; align-items:center; justify-content:center;">✕</button>
+        </div>
+      </div>
+
+      <div id="ado-inspect-banner" style="display:none; margin: 10px 20px 0 20px; padding: 10px 14px; border-radius: 8px;"></div>
+
+      <div style="padding: 8px 20px; background:#0b1329; border-bottom:1px solid #1e293b; display:flex; gap:8px; align-items:center; margin-top:4px;">
+        <button id="ado-filter-all-btn" type="button" style="padding:4px 12px; border-radius:5px; font-size:11.5px; font-weight:600; cursor:pointer; background:#2563eb; color:#fff; border:none;">Tất cả (${ids.length})</button>
+        <button id="ado-filter-missing-btn" type="button" style="padding:4px 12px; border-radius:5px; font-size:11.5px; font-weight:600; cursor:pointer; background:#334155; color:${missingCount > 0 ? '#f87171' : '#94a3b8'}; border:1px solid ${missingCount > 0 ? '#ef4444' : '#475569'};">⚠️ Chỉ xem xe thiếu / sai (${missingCount})</button>
+      </div>
+
+      <div style="flex:1; overflow-y:auto; padding:12px 20px;">
+        <table style="width:100%; border-collapse:collapse; font-size:12px; text-align:left;">
+          <thead>
+            <tr style="border-bottom:1px solid #334155; color:#94a3b8; font-size:11px; text-transform:uppercase;">
+              <th style="padding:8px 10px;">Box ID</th>
+              <th style="padding:8px 10px;">Trạng Thái</th>
+              <th style="padding:8px 10px;">FRONT (T / O)</th>
+              <th style="padding:8px 10px;">REAR (T / O)</th>
+              <th style="padding:8px 10px;">LEFT (T / O)</th>
+              <th style="padding:8px 10px;">RIGHT (T / O)</th>
+            </tr>
+          </thead>
+          <tbody id="ado-inspect-tbody">
+          </tbody>
+        </table>
+      </div>
+
+      <div style="padding:10px 20px; border-top:1px solid #334155; background:#1e293b; display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:11px; color:#94a3b8;">💡 Bấm <b>🔍 Kiểm Tra (Check)</b> để so sánh thông số hiện tại trên web với dữ liệu lưu tạm.</span>
+        <button id="ado-inspect-ok-btn" type="button" style="padding:5px 16px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; font-size:12px; cursor:pointer;">Đóng [Esc]</button>
+      </div>
+    `;
+
+    inspectionModalEl.innerHTML = '';
+    inspectionModalEl.appendChild(card);
+    inspectionModalEl.style.display = 'flex';
+
+    function renderRows(filterMissingOnly = false) {
+      const tbody = card.querySelector('#ado-inspect-tbody');
+      tbody.innerHTML = '';
+
+      const itemsToShow = filterMissingOnly ? rowsInfo.filter(r => !r.isComplete || r.isMismatch) : rowsInfo;
+
+      if (itemsToShow.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" style="padding:30px; text-align:center; color:#94a3b8; font-style:italic;">Không có xe nào để hiển thị!</td></tr>`;
+        return;
+      }
+
+      for (const row of itemsToShow) {
+        const tr = document.createElement('tr');
+        tr.style.borderBottom = '1px solid #1e293b';
+        if (row.isMismatch) {
+          tr.style.backgroundColor = 'rgba(239, 68, 68, 0.18)';
+        } else if (!row.isComplete) {
+          tr.style.backgroundColor = 'rgba(239, 68, 68, 0.08)';
+        }
+
+        const renderCell = (cam) => {
+          const c = row.camReport[cam];
+          const isCamMismatch = row.mismatchCams && row.mismatchCams.has(cam);
+          const isErr = c.tMissing || c.oMissing || isCamMismatch;
+          if (isErr) {
+            return `<td style="padding:8px 10px; background:rgba(239, 68, 68, 0.22); border:1px solid rgba(239, 68, 68, 0.4); font-family:monospace; font-weight:700;">
+              <span style="${c.tMissing || isCamMismatch ? 'color:#ef4444; text-decoration:underline;' : 'color:#cbd5e1;'}">${c.t}</span> /
+              <span style="${c.oMissing || isCamMismatch ? 'color:#ef4444; text-decoration:underline;' : 'color:#cbd5e1;'}">${c.o}</span>
+              <span style="font-size:11px; margin-left:3px; color:#f87171;">${isCamMismatch ? '❗' : '⚠️'}</span>
+            </td>`;
+          }
+          return `<td style="padding:8px 10px; color:#cbd5e1; font-family:monospace;">${c.t} / ${c.o}</td>`;
+        };
+
+        tr.innerHTML = `
+          <td style="padding:8px 10px; font-weight:700; color:${row.isMismatch || !row.isComplete ? '#f87171' : '#38bdf8'}; font-family:monospace; font-size:13px;">#${row.id}</td>
+          <td style="padding:8px 10px;">
+            ${row.isMismatch
+              ? `<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 7px; border-radius:4px; background:rgba(239, 68, 68, 0.3); color:#fca5a5; font-size:11px; font-weight:800; border:1px solid #ef4444;">❗ SAI / LỆCH</span>`
+              : (row.isComplete
+                ? `<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 7px; border-radius:4px; background:rgba(34, 197, 94, 0.15); color:#4ade80; font-size:11px; font-weight:600;">✓ Đủ 8/8</span>`
+                : `<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 7px; border-radius:4px; background:rgba(239, 68, 68, 0.25); color:#f87171; font-size:11px; font-weight:700;">⚠️ Thiếu</span>`)
+            }
+          </td>
+          ${renderCell('front')}
+          ${renderCell('rear')}
+          ${renderCell('left')}
+          ${renderCell('right')}
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    renderRows(false);
+
+    // Xử lý nút Kiểm Tra (Check)
+    const checkBtn = card.querySelector('#ado-check-diff-btn');
+    checkBtn.onclick = async () => {
+      checkBtn.innerHTML = `<span>⏳</span><span>Đang kiểm tra...</span>`;
+      checkBtn.disabled = true;
+
+      const objItems = getObjectListItems();
+      const currentLive = {};
+
+      for (let i = 0; i < objItems.length; i++) {
+        const it = objItems[i];
+        await selectBoxItem(it);
+        await new Promise(r => setTimeout(r, 100));
+        const live = readCameraAttrs();
+        if (live) currentLive[it.id] = live;
+      }
+
+      const mismatchedIds = [];
+
+      for (const row of rowsInfo) {
+        const id = row.id;
+        const exp = data[id];
+        const act = currentLive[id];
+
+        row.mismatchCams = new Set();
+        let isWrong = false;
+
+        if (!act) {
+          isWrong = true;
+          for (const c of ['front', 'rear', 'left', 'right']) row.mismatchCams.add(c);
+        } else {
+          for (const cam of ['front', 'rear', 'left', 'right']) {
+            const expT = String(exp?.[cam]?.t ?? '');
+            const expO = String(exp?.[cam]?.o ?? '');
+            const actT = String(act?.[cam]?.t ?? '');
+            const actO = String(act?.[cam]?.o ?? '');
+
+            if (expT !== actT || expO !== actO) {
+              isWrong = true;
+              row.mismatchCams.add(cam);
+            }
+          }
+        }
+
+        row.isMismatch = isWrong;
+        if (isWrong) mismatchedIds.push(id);
+      }
+
+      // Sắp xếp lại: xe bị lệch lên trước hết
+      rowsInfo.sort((a, b) => {
+        if (a.isMismatch !== b.isMismatch) return a.isMismatch ? -1 : 1;
+        if (a.isComplete !== b.isComplete) return a.isComplete ? 1 : -1;
+        return Number(a.id) - Number(b.id);
+      });
+
+      checkBtn.innerHTML = `<span>🔍</span><span>Kiểm Tra (Check)</span>`;
+      checkBtn.disabled = false;
+
+      renderRows(false);
+
+      const banner = card.querySelector('#ado-inspect-banner');
+      banner.style.display = 'block';
+
+      if (mismatchedIds.length === 1) {
+        // Đúng 1 ID bị sai: Mạnh dạn hỏi xóa lưu tạm
+        banner.style.background = 'rgba(245, 158, 11, 0.15)';
+        banner.style.border = '1px solid #f59e0b';
+        banner.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <span style="color:#fbbf24; font-size:12.5px; font-weight:600;">
+              ❗ Chỉ phát hiện đúng <b>1 xe (#${mismatchedIds[0]})</b> bị sai/lệch T/O! Bạn có muốn xóa bộ nhớ lưu tạm không?
+            </span>
+            <div style="display:flex; gap:6px;">
+              <button id="ado-banner-clear-btn" type="button" style="padding:4px 12px; border-radius:5px; background:#dc2626; border:1px solid #ef4444; color:#fff; font-weight:700; font-size:11.5px; cursor:pointer;">
+                Có, Xóa Lưu Tạm
+              </button>
+              <button id="ado-banner-keep-btn" type="button" style="padding:4px 10px; border-radius:5px; background:#334155; border:1px solid #475569; color:#cbd5e1; font-weight:600; font-size:11.5px; cursor:pointer;">
+                Để Lại
+              </button>
+            </div>
+          </div>
+        `;
+        banner.querySelector('#ado-banner-clear-btn').onclick = () => {
+          clearTempCamAttrs();
+          banner.innerHTML = `<span style="color:#4ade80; font-size:12px; font-weight:600;">✓ Đã xóa sạch bộ nhớ tạm T/O!</span>`;
+        };
+        banner.querySelector('#ado-banner-keep-btn').onclick = () => {
+          banner.style.display = 'none';
+        };
+      } else if (mismatchedIds.length >= 2) {
+        // Trên 1 ID bị sai (>= 2): Chỉ hiển thị thông báo, KHÔNG hỏi gì thêm
+        banner.style.background = 'rgba(239, 68, 68, 0.15)';
+        banner.style.border = '1px solid #ef4444';
+        banner.innerHTML = `
+          <span style="color:#f87171; font-size:12.5px; font-weight:600;">
+            ⚠️ Phát hiện <b>${mismatchedIds.length} xe</b> bị sai/lệch T/O: <b>#${mismatchedIds.join(', #')}</b>! Hãy kiểm tra lại.
+          </span>
+        `;
+      } else {
+        // 0 ID sai (Khớp 100%)
+        banner.style.background = 'rgba(34, 197, 94, 0.15)';
+        banner.style.border = '1px solid #22c55e';
+        banner.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <span style="color:#4ade80; font-size:12.5px; font-weight:600;">
+              🎉 Khớp 100%! Toàn bộ ${rowsInfo.length} xe đều đã được gán chuẩn xác! Bạn có muốn xóa lưu tạm không?
+            </span>
+            <button id="ado-banner-clear-perfect" type="button" style="padding:4px 12px; border-radius:5px; background:#dc2626; border:1px solid #ef4444; color:#fff; font-weight:700; font-size:11.5px; cursor:pointer;">
+              Xóa Lưu Tạm
+            </button>
+          </div>
+        `;
+        banner.querySelector('#ado-banner-clear-perfect').onclick = () => {
+          clearTempCamAttrs();
+          banner.innerHTML = `<span style="color:#4ade80; font-size:12px; font-weight:600;">✓ Đã xóa sạch bộ nhớ tạm T/O!</span>`;
+        };
+      }
+    };
+
+    // Nút Xóa lưu tạm ngay trên header
+    const modalClearBtn = card.querySelector('#ado-modal-clear-btn');
+    modalClearBtn.onclick = () => {
+      clearTempCamAttrs();
+      modalClearBtn.innerHTML = `<span>✓</span><span>Đã xóa tạm</span>`;
+      modalClearBtn.style.background = 'rgba(34, 197, 94, 0.15)';
+      modalClearBtn.style.color = '#4ade80';
+      modalClearBtn.style.borderColor = '#22c55e';
+    };
+
+    const allBtn = card.querySelector('#ado-filter-all-btn');
+    const missingBtn = card.querySelector('#ado-filter-missing-btn');
+
+    allBtn.onclick = () => {
+      allBtn.style.background = '#2563eb'; allBtn.style.color = '#fff';
+      missingBtn.style.background = '#334155'; missingBtn.style.color = missingCount > 0 ? '#f87171' : '#94a3b8';
+      renderRows(false);
+    };
+
+    missingBtn.onclick = () => {
+      missingBtn.style.background = '#dc2626'; missingBtn.style.color = '#fff';
+      allBtn.style.background = '#334155'; allBtn.style.color = '#94a3b8';
+      renderRows(true);
+    };
+
+    const close = () => {
+      inspectionModalEl.style.display = 'none';
+      window.removeEventListener('keydown', onEsc);
+    };
+
+    const onEsc = (e) => {
+      if (e.key === 'Escape') close();
+    };
+
+    card.querySelector('#ado-close-inspect-btn').onclick = close;
+    card.querySelector('#ado-inspect-ok-btn').onclick = close;
+    window.addEventListener('keydown', onEsc);
+  }
+
+  function runConsoleScan() {
+    const allSpans = Array.from(document.querySelectorAll('span, button'));
+    const objHeader = allSpans.find(s => s.children.length === 0 && (s.textContent.includes('Object (') || s.textContent.includes('객체 (')));
+    const countText = objHeader ? objHeader.textContent.trim() : 'Object (?/?)';
+
+    const objItems = getObjectListItems();
+    console.clear();
+    console.log('%c====================================================', 'color: #a855f7; font-weight: bold;');
+    console.log('%c🔍 [ALCHERA ADO - CONSOLE OBJECT SCANNER]', 'color: #38bdf8; font-size: 15px; font-weight: bold;');
+    console.log(`📊 Tiêu đề Sidebar: %c${countText}`, 'color: #fbbf24; font-weight: bold;');
+    console.log(`📋 Số lượng box tìm thấy trong danh sách: %c${objItems.length} objects`, 'color: #4ade80; font-weight: bold;');
+
+    // 1. Check Direct Memory Extraction (Không cần nhảy)
+    const directReactObjects = extractDirectFromReact();
+    if (directReactObjects && directReactObjects.length > 0) {
+      console.log('%c⚡ ĐÃ ĐỌC TRỰC TIẾP TỪ BỘ NHỚ REACT (KHÔNG CẦN NHẢY TỪNG BOX)!', 'color: #22c55e; font-weight: bold;');
+      console.log('📦 Dữ liệu gốc trong React State:', directReactObjects);
+
+      const reactCamMap = {};
+      directReactObjects.forEach(obj => {
+        const id = obj.id ?? obj.tracking_id ?? obj.object_id;
+        const props = obj.camera_properties ?? obj.camera_attributes ?? obj.cameraAttributes ?? obj.cameraProps;
+        if (id !== undefined && props) {
+          reactCamMap[String(id)] = {};
+          for (const cam of ['front', 'rear', 'left', 'right']) {
+            if (props[cam]) {
+              reactCamMap[String(id)][cam] = {
+                t: props[cam].truncation ?? props[cam].t ?? '',
+                o: props[cam].occlusion ?? props[cam].o ?? ''
+              };
+            }
+          }
+        }
+      });
+
+      if (Object.keys(reactCamMap).length > 0) {
+        console.table(reactCamMap);
+        localStorage.setItem('ado_temp_cam_attrs', JSON.stringify(reactCamMap));
+        for (const [id, val] of Object.entries(reactCamMap)) {
+          camAttrCacheById.set(id, val);
+        }
+        showToast(`⚡ Đọc nhanh Console: ${Object.keys(reactCamMap).length} box!`);
+        showCamAttrsInspectionModal(reactCamMap, 'Quét Nhanh Console');
+        console.log('%c====================================================', 'color: #a855f7; font-weight: bold;');
+        return;
+      }
+    }
+
+    // 2. Table from Current Object List & Cache
+    let stored = {};
+    try {
+      stored = JSON.parse(localStorage.getItem('ado_temp_cam_attrs') || '{}');
+    } catch (e) {}
+
+    for (const [id, val] of camAttrCacheById.entries()) {
+      if (!stored[id]) stored[id] = val;
+    }
+
+    const tableRows = [];
+    for (const item of objItems) {
+      const id = item.id;
+      const cam = stored[id] || camAttrCacheById.get(id) || {};
+      tableRows.push({
+        'Box ID': `#${id}`,
+        'Dòng hiển thị': item.element?.textContent?.trim() || '',
+        'Front (T / O)': `${cam.front?.t ?? '—'} / ${cam.front?.o ?? '—'}`,
+        'Rear (T / O)': `${cam.rear?.t ?? '—'} / ${cam.rear?.o ?? '—'}`,
+        'Left (T / O)': `${cam.left?.t ?? '—'} / ${cam.left?.o ?? '—'}`,
+        'Right (T / O)': `${cam.right?.t ?? '—'} / ${cam.right?.o ?? '—'}`
+      });
+    }
+
+    console.table(tableRows);
+    console.log('💾 Dữ liệu T/O trong bộ nhớ:', stored);
+    console.log('%c====================================================', 'color: #a855f7; font-weight: bold;');
+
+    showToast(`🔍 ${countText} (${objItems.length} box) — Mở bảng kiểm soát T/O!`);
+    showCamAttrsInspectionModal(stored, 'Quét Console (Từ Bộ Nhớ)');
+  }
+
+  window.adoScan = runConsoleScan;
+
+  async function saveTempCamAttrs() {
+    const objItems = getObjectListItems();
+    console.log('[ADO] Save - Scanning Object List rows (sorted top to bottom):', objItems.map(o => o.id));
+
+    const passData = { 1: {}, 2: {} };
+
+    if (objItems.length > 0) {
+      showToast(`🚀 Bắt đầu quét 2 lượt từ ô đầu tiên (#${objItems[0].id})...`);
+
+      // Quét 2 lượt đối soát từ ô đầu tiên
+      for (let pass = 1; pass <= 2; pass++) {
+        for (let idx = 0; idx < objItems.length; idx++) {
+          const item = objItems[idx];
+          await selectBoxItem(item);
+          showToast(`⏳ Lượt ${pass}/2: Quét box ${idx + 1}/${objItems.length} (#${item.id})...`);
+          await new Promise(r => setTimeout(r, 160));
+          let attrs = readCameraAttrs();
+          if (!attrs) {
+            await new Promise(r => setTimeout(r, 120));
+            attrs = readCameraAttrs();
+          }
+          if (attrs) {
+            passData[pass][item.id] = attrs;
+          }
+        }
+      }
+    } else {
+      // Fallback if object list not found
+      recordActiveBoxCamAttrs();
+      const canvas = document.querySelector('canvas') || document.body;
+      if (canvas) canvas.focus();
+      for (let i = 0; i < 16; i++) {
+        canvas.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab', keyCode: 9, which: 9, bubbles: true, cancelable: true }));
+        await new Promise(r => setTimeout(r, 130));
+        recordActiveBoxCamAttrs();
+      }
+    }
+
+    // Đối soát 2 lượt & Hợp nhất: ƯU TIÊN GIÁ TRỊ CÓ DỮ LIỆU
+    const finalData = {};
+    const differences = [];
+    const allIds = new Set([...Object.keys(passData[1]), ...Object.keys(passData[2])]);
+
+    for (const id of allIds) {
+      const p1 = passData[1][id] || {};
+      const p2 = passData[2][id] || {};
+      finalData[id] = {};
+
+      for (const cam of ['front', 'rear', 'left', 'right']) {
+        const t1 = p1[cam]?.t ?? '';
+        const t2 = p2[cam]?.t ?? '';
+        const o1 = p1[cam]?.o ?? '';
+        const o2 = p2[cam]?.o ?? '';
+
+        // Ưu tiên cái nào có số
+        const finalT = (t2 !== '' && t2 !== null) ? t2 : t1;
+        const finalO = (o2 !== '' && o2 !== null) ? o2 : o1;
+
+        finalData[id][cam] = { t: finalT, o: finalO };
+
+        if ((t1 !== '' && t2 === '') || (t1 === '' && t2 !== '')) {
+          differences.push({ id, cam, prop: 'T', chosen: finalT });
+        }
+        if ((o1 !== '' && o2 === '') || (o1 === '' && o2 !== '')) {
+          differences.push({ id, cam, prop: 'O', chosen: finalO });
+        }
+      }
+    }
+
+    // Merge with any cache already in memory
+    for (const [id, val] of camAttrCacheById.entries()) {
+      if (!finalData[id]) finalData[id] = val;
+    }
+
+    const count = Object.keys(finalData).length;
+    if (count === 0) {
+      showToast("⚠️ Chưa có thông số T/O nào để lưu tạm! Hãy đảm bảo đã nhập T/O cho các xe.");
+      return false;
+    }
+
+    // Save to memory cache and localStorage
+    for (const [id, val] of Object.entries(finalData)) {
+      camAttrCacheById.set(id, val);
+    }
+    try {
+      localStorage.setItem('ado_temp_cam_attrs', JSON.stringify(finalData));
+      localStorage.setItem('ado_temp_cam_time', String(Date.now()));
+    } catch (e) {}
+
+    const idsList = Object.keys(finalData).join(', #');
+    if (differences.length === 0) {
+      showToast(`💾 Đã lưu tạm ${count} box! Mở bảng kiểm soát...`);
+    } else {
+      const diffIds = [...new Set(differences.map(d => d.id))].join(', #');
+      showToast(`⚡ Đã lưu tạm ${count} box (đối soát khớp #${diffIds})! Mở bảng kiểm soát...`);
+    }
+
+    // Mở ngay Bảng kiểm soát trực quan (không tải file json nữa)
+    showCamAttrsInspectionModal(finalData, 'Quét Từng Xe');
+
+    return true;
+  }
+
+  async function pasteTempCamAttrs() {
+    let stored = {};
+    try {
+      stored = JSON.parse(localStorage.getItem('ado_temp_cam_attrs') || '{}');
+    } catch (e) {}
+
+    for (const [id, val] of camAttrCacheById.entries()) {
+      if (!stored[id]) stored[id] = val;
+    }
+
+    const totalKnown = Object.keys(stored).length;
+    if (totalKnown === 0) {
+      showToast("⚠️ Bộ nhớ trống! Hãy bấm '💾 Lưu Tạm T/O' ở frame trước trước khi dán.");
+      return false;
+    }
+
+    const idsList = Object.keys(stored).join(', #');
+    showToast(`⏳ Bắt đầu dán T/O cho các box: #${idsList}...`);
+
+    let updatedCount = 0;
+    const visitedIds = new Set();
+
+    // 1. Quét tất cả các box trong Object List
+    const allBtns = getAllObjectButtons();
+    console.log('[ADO] Paste - All Object rows:', allBtns.map(o => o.id));
+
+    if (allBtns.length > 0) {
+      for (let idx = 0; idx < allBtns.length; idx++) {
+        const item = allBtns[idx];
+        if (stored[item.id]) {
+          await selectBoxItem(item);
+          showToast(`⏳ Đang dán T/O: box ${idx + 1} / ${allBtns.length} (#${item.id})...`);
+          await new Promise(r => setTimeout(r, 160));
+          let ok = writeCameraAttrs(stored[item.id]);
+          if (!ok) {
+            await new Promise(r => setTimeout(r, 140));
+            ok = writeCameraAttrs(stored[item.id]);
+          }
+          if (ok) {
+            visitedIds.add(item.id);
+            updatedCount++;
+            await new Promise(r => setTimeout(r, 80));
+          }
+        }
+      }
+    }
+
+    // 2. TẬP TRUNG XỬ LÝ NHỮNG BOX CÒN KẸT CHỮ "T/O" (CẢNH BÁO CHƯA NHẬP)
+    await new Promise(r => setTimeout(r, 180));
+    let stuckBoxes = getUnenteredBoxItems();
+    console.log('[ADO] Checking remaining boxes stuck with T/O badge:', stuckBoxes.map(b => b.id));
+
+    if (stuckBoxes.length > 0) {
+      for (const item of stuckBoxes) {
+        if (stored[item.id]) {
+          console.log(`[ADO] 🎯 Đang dán bù cho box #${item.id} còn kẹt chữ T/O...`);
+          showToast(`🎯 Đang dán bù cho box #${item.id} (còn kẹt chữ T/O)...`);
+          item.button.click();
+          await new Promise(r => setTimeout(r, 200));
+          const ok = writeCameraAttrs(stored[item.id]);
+          if (ok) {
+            visitedIds.add(item.id);
+            updatedCount++;
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+      }
+    }
+
+    // 3. Fallback: Tab cycling nếu vẫn còn box kẹt chữ T/O
+    stuckBoxes = getUnenteredBoxItems();
+    if (stuckBoxes.length > 0) {
+      const canvas = document.querySelector('canvas') || document.body;
+      if (canvas) canvas.focus();
+
+      for (let step = 0; step < 20; step++) {
+        stuckBoxes = getUnenteredBoxItems();
+        if (stuckBoxes.length === 0) break;
+
+        const curId = findCurrentActiveBoxId();
+        if (curId && stored[curId] && stuckBoxes.some(b => b.id === curId)) {
+          const ok = writeCameraAttrs(stored[curId]);
+          if (ok) {
+            visitedIds.add(curId);
+            updatedCount++;
+            await new Promise(r => setTimeout(r, 90));
+          }
+        }
+
+        canvas.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', code: 'Tab', keyCode: 9, which: 9, bubbles: true, cancelable: true }));
+        await new Promise(r => setTimeout(r, 120));
+      }
+    }
+
+    // 4. Báo cáo kết quả
+    const remainingStuck = getUnenteredBoxItems();
+    if (remainingStuck.length === 0) {
+      showToast(`🎉 Tuyệt vời! Đã dán hoàn tất và XÓA SẠCH toàn bộ chữ T/O trên tất cả các box!`);
+    } else {
+      const remList = remainingStuck.map(r => r.id).join(', #');
+      showToast(`⚠️ Còn box (#${remList}) kẹt chữ T/O, bạn chỉ cần bấm '📥 Dán T/O' thêm lần nữa để dán nốt!`);
+    }
+
+    console.log('[ADO] Pasted to boxes:', Array.from(visitedIds));
+
+    // Sau khi dán xong: Mở ngay Bảng kiểm soát T/O (có nút Check và nút Xóa lưu tạm)
+    if (updatedCount > 0) {
+      setTimeout(() => {
+        showCamAttrsInspectionModal(stored, 'Sau Khi Dán (Paste)');
+      }, 500);
+    }
+
+    return updatedCount > 0;
+  }
+
+  function clearTempCamAttrs() {
+    camAttrCacheById.clear();
+    try {
+      localStorage.removeItem('ado_temp_cam_attrs');
+      localStorage.removeItem('ado_temp_cam_time');
+    } catch (e) {}
+    showToast("🗑️ Đã xóa sạch bộ nhớ lưu tạm T/O!");
+  }
+
+
+
+  let isBypassingL = false;
+
+  function dispatchNativeL() {
+    isBypassingL = true;
+    const canvas = document.querySelector('canvas') || document.body;
+    if (canvas) canvas.focus();
+    const eventDown = new KeyboardEvent('keydown', {
+      key: 'l',
+      code: 'KeyL',
+      keyCode: 76,
+      which: 76,
+      bubbles: true,
+      cancelable: true
+    });
+    window.dispatchEvent(eventDown);
+    const eventUp = new KeyboardEvent('keyup', {
+      key: 'l',
+      code: 'KeyL',
+      keyCode: 76,
+      which: 76,
+      bubbles: true,
+      cancelable: true
+    });
+    window.dispatchEvent(eventUp);
+    setTimeout(() => { isBypassingL = false; }, 250);
+  }
+
+  let lModalOverlay = null;
+
+  function showLConfirmModal() {
+    if (!lModalOverlay) {
+      lModalOverlay = document.createElement('div');
+      lModalOverlay.id = 'ado-l-confirm-modal';
+      Object.assign(lModalOverlay.style, {
+        position: 'fixed',
+        inset: '0',
+        zIndex: '10000065',
+        backgroundColor: 'rgba(2, 6, 23, 0.75)',
+        backdropFilter: 'blur(4px)',
+        display: 'none',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: 'ui-sans-serif, system-ui, sans-serif'
+      });
+
+      const card = document.createElement('div');
+      Object.assign(card.style, {
+        width: '400px',
+        maxWidth: '92vw',
+        padding: '16px 20px',
+        borderRadius: '12px',
+        backgroundColor: '#0f172a',
+        border: '1px solid #334155',
+        boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.9)',
+        color: '#f8fafc',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '12px'
+      });
+
+      card.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:22px;">📋</span>
+          <div>
+            <div style="font-size:14px; font-weight:700; color:#fbbf24;">Sao chép từ Frame trước (Phím L)</div>
+            <div style="font-size:11px; color:#94a3b8;">Xác nhận thuộc tính Camera (Truncation & Occlusion)</div>
+          </div>
+        </div>
+        <div style="font-size:12px; color:#e2e8f0; line-height:1.5;">
+          Bạn có muốn <b>sao chép toàn bộ thuộc tính</b> bao gồm cả <b>T & O của 4 Camera</b> từ frame trước sang không?
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+          <button id="ado-l-no-btn" type="button" style="padding:6px 14px; border-radius:6px; background:#1e293b; border:1px solid #475569; color:#94a3b8; font-weight:600; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            Không (No) [N / Esc]
+          </button>
+          <button id="ado-l-yes-btn" type="button" style="padding:6px 16px; border-radius:6px; background:#2563eb; border:1px solid #3b82f6; color:#ffffff; font-weight:700; font-size:11.5px; cursor:pointer; transition:all 0.15s ease;">
+            Có (Gồm T/O) [Y / Enter]
+          </button>
+        </div>
+      `;
+
+      lModalOverlay.appendChild(card);
+      document.body.appendChild(lModalOverlay);
+    }
+
+    const yesBtn = lModalOverlay.querySelector('#ado-l-yes-btn');
+    const noBtn = lModalOverlay.querySelector('#ado-l-no-btn');
+
+    function chooseLNo() {
+      lModalOverlay.style.display = 'none';
+      window.removeEventListener('keydown', onLConfirmKeyDown, true);
+      dispatchNativeL();
+      showToast("📋 Đã sao chép từ Frame trước bình thường (không gồm T/O).");
+    }
+
+    function chooseLYes() {
+      lModalOverlay.style.display = 'none';
+      window.removeEventListener('keydown', onLConfirmKeyDown, true);
+      dispatchNativeL();
+      setTimeout(() => {
+        pasteTempCamAttrs();
+      }, 750);
+    }
+
+    function onLConfirmKeyDown(e) {
+      if (lModalOverlay.style.display !== 'none') {
+        if (e.key === 'y' || e.key === 'Y' || e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          chooseLYes();
+        } else if (e.key === 'n' || e.key === 'N' || e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          chooseLNo();
+        }
+      }
+    }
+
+    yesBtn.onclick = (e) => { e.stopPropagation(); chooseLYes(); };
+    noBtn.onclick = (e) => { e.stopPropagation(); chooseLNo(); };
+
+    window.addEventListener('keydown', onLConfirmKeyDown, true);
+    lModalOverlay.style.display = 'flex';
+  }
+
+  // Intercept Ctrl + C, Ctrl + V, and L
+  window.addEventListener('keydown', (e) => {
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      if (active.id === 'ado-hotkey-search-box') return;
+      if (active.type === 'text' && window.getSelection()?.toString().length > 0) return;
+    }
+
+    // 0. Phím ` hoặc ~ (Bật/Tắt Viewmode Camera 2D)
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && (e.code === 'Backquote' || e.key === '`' || e.key === '~')) {
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      toggleViewmode();
+      return;
+    }
+
+    // 0.1 Phím , (Dấu phẩy) để Mở / Đóng Bảng T/O Chỉnh Nhanh (chỉ khi đang ở Viewmode)
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && (e.key === ',' || e.code === 'Comma')) {
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+      if (isViewmodeActive) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleQuickTOModal();
+        return;
+      }
+    }
+
+    // 0.2 Phím Escape đóng Bảng T/O Chỉnh Nhanh nếu đang mở
+    if (e.key === 'Escape') {
+      const qModal = document.getElementById('ado-quick-to-modal');
+      if (qModal && qModal.style.display !== 'none') {
+        e.preventDefault();
+        e.stopPropagation();
+        qModal.style.display = 'none';
+        return;
+      }
+    }
+
+    // 1. Phím L (Copy từ Frame trước)
+    if (!e.ctrlKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === 'l') {
+      if (isBypassingL) return;
+      e.preventDefault();
+      e.stopPropagation();
+      showLConfirmModal();
+      return;
+    }
+
+
+
+    // 2. Ctrl + C (Copy)
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && !e.shiftKey && !e.altKey) {
+      const camData = readCameraAttrs();
+      if (camData) {
+        setTimeout(() => showCopyConfirmModal(camData), 50);
+      }
+    }
+
+    // 3. Ctrl + V or Ctrl + Shift + V (Paste with Class, Subclass & Camera T/O)
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+      if (savedBoxData) {
+        let attempts = 0;
+        const pasteInterval = setInterval(async () => {
+          attempts++;
+          let appliedClass = false;
+          if (savedBoxData.category && savedBoxData.subclass) {
+            const grp = PJT64_CLASSES.find(c => c.category.toUpperCase() === savedBoxData.category.toUpperCase());
+            const sub = grp?.subclasses.find(s => s.name.toLowerCase() === savedBoxData.subclass.toLowerCase());
+            if (grp && sub) {
+              appliedClass = await changeCategoryAndSubclass(grp, sub);
+            }
+          }
+          let okCam = true;
+          if (copyIncludesCam && savedBoxData.camAttrs) {
+            okCam = writeCameraAttrs(savedBoxData.camAttrs);
+          }
+          if (appliedClass || okCam || attempts > 12) {
+            clearInterval(pasteInterval);
+            const classInfo = savedBoxData.category ? `<b>${savedBoxData.category} / ${savedBoxData.subclass}</b> ` : '';
+            showToast(`✨ Đã dán hoàn tất: ${classInfo}${copyIncludesCam && savedBoxData.camAttrs ? '+ Camera T/O' : ''}!`);
+          }
+        }, 140);
+      }
+    }
+  }, true);
+
+
+  // =========================================================================
+  // 13.7. FRAME CHANGE DETECTION & AUTOMATIC VIEWMODE SYNCHRONIZATION
+  // =========================================================================
+  let lastKnownFramePcd = null;
+  function checkFrameChangeSync() {
+    const pcdSpan = document.querySelector('span.truncate.text-\\[11px\\].text-slate-500');
+    const frameInput = document.querySelector('input.w-10.rounded-md');
+    const curIndicator = (pcdSpan?.textContent?.trim() || '') + '__' + (frameInput?.value?.trim() || '');
+
+    if (curIndicator && curIndicator !== '__' && curIndicator !== lastKnownFramePcd) {
+      const isFirst = lastKnownFramePcd === null;
+      lastKnownFramePcd = curIndicator;
+
+      if (!isFirst) {
+        console.log('[ADO Userscript] Chuyá»ƒn sang Frame má»›i:', curIndicator);
+        // 1. XÃ³a sáº¡ch cache box vÃ  camera cá»§a frame trÆ°á»›c
+        viewmodeBoxCamMap.clear();
+        lastViewmodeBoxId = null;
+
+        // 2. Chá» DOM frame má»›i táº£i xong rá»“i tá»± Ä‘á»™ng Ä‘á»“ng bá»™ láº¡i ngay
+        setTimeout(() => {
+          if (isViewmodeActive) {
+            const newBoxId = findCurrentActiveBoxId();
+            if (newBoxId) {
+              const freshCams = autoDetectCamerasForBox();
+              viewmodeBoxCamMap.set(newBoxId, freshCams);
+              lastViewmodeBoxId = newBoxId;
+            }
+            updateViewmodeUI();
+            if (quickTOModalEl && quickTOModalEl.style.display !== 'none') {
+              populateQuickTOModal();
+            }
+          }
+        }, 350);
+      }
+    }
+  }
+  setInterval(checkFrameChangeSync, 250);
+  // =========================================================================
+  // 14. INITIALIZATION & OBSERVER
+  // =========================================================================
+
+  function init() {
+    createBottomTaskbar();
+    triggerTranslation();
+    tryAutoSelectROI();
+    tryAutoEnableHeightZFilter();
+
+    const observer = new MutationObserver((mutations) => {
+      let shouldTranslate = false;
+
+      for (let i = 0; i < mutations.length; i++) {
+        const m = mutations[i];
+        if (m.target && (m.target.id === 'ado-custom-taskbar' || m.target.id === 'ado-class-flyout' || m.target.id === 'ado-hotkey-modal-overlay' || m.target.id === 'ado-top-active-class' || m.target.id === 'ado-copy-confirm-modal' || m.target.id === 'ado-l-confirm-modal' || m.target.id === 'ado-quick-to-modal' || m.target.id === 'ado-subclass-desc-overlay' || (m.target.classList && m.target.classList.contains('ado-cam-toggle-btn')))) continue;
+        if (m.target && m.target.closest && (m.target.closest('#ado-custom-taskbar') || m.target.closest('#ado-class-flyout') || m.target.closest('#ado-hotkey-modal-overlay') || m.target.closest('#ado-top-active-class') || m.target.closest('#ado-copy-confirm-modal') || m.target.closest('#ado-l-confirm-modal') || m.target.closest('#ado-quick-to-modal') || m.target.closest('#ado-subclass-desc-overlay') || m.target.closest('.ado-cam-toggle-btn'))) continue;
+
+        shouldTranslate = true;
+        break;
+      }
+
+      if (shouldTranslate) {
+        triggerTranslation();
+      }
+
+      if (!hasAutoSelectedROI) {
+        tryAutoSelectROI();
+      }
+
+      if (!hasAutoEnabledHeightZ) {
+        tryAutoEnableHeightZFilter();
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+
+    let retryCount = 0;
+    const interval = setInterval(() => {
+      retryCount++;
+      tryAutoSelectROI();
+      tryAutoEnableHeightZFilter();
+      if ((hasAutoSelectedROI && hasAutoEnabledHeightZ) || retryCount > 40) {
+        clearInterval(interval);
+      }
+    }, 500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
