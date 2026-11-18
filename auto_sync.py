@@ -12,7 +12,7 @@ WM_KEYUP = 0x0101
 VK_RIGHT = 0x27
 
 USER_PROFILE = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-UNITY_SEQUENCE_DIR = os.path.join(USER_PROFILE, "AppData", "LocalLow", "Alchera Inc", "ADO-anntoation-tool", "sequence")
+UNITY_SEQUENCE_DIR = os.path.join(USER_PROFILE, "AppData", "LocalLow", "... Inc", "ADO-anntoation-tool", "sequence")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_CACHE_ANN_DIR = os.path.join(BASE_DIR, "cache", "annotations")
 
