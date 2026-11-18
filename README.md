@@ -1,247 +1,227 @@
-# ADO 3D Object Detection - Web Annotation Tool & System Documentation
+# 3D LiDAR Object Detection — Web Annotation Tool & System Architecture
 
-Tài liệu hướng dẫn toàn diện về kiến trúc, cơ chế hoạt động, cấu trúc Cache, cách sao lưu dữ liệu và hướng dẫn vận hành/nâng cấp hệ thống dành cho người dùng và các trợ lý AI kế thừa dự án.
-
----
-
-## 📑 Mục Lục
-1. [Tổng Quan Hệ Thống](#1-tổng-quan-hệ-thống)
-2. [Cấu Trúc Thư Mục & Các Tệp Tin Quan Trọng](#2-cấu-trúc-thư-mục--các-tệp-tin-quan-trọng)
-3. [Cơ Chế Cache Của Tool Gốc Unity và Web Tool](#3-cơ-chế-cache-của-tool-gốc-unity-và-web-tool)
-   - [3.1. Cache Gốc Unity ](#31-cache-gốc-unity-tool)
-   - [3.2. Cache Web Tool (Local Cache H:\a\cache)](#32-cache-web-tool-local-cache-hacache)
-   - [3.3. Quy Tắc Bất Biến Khi Đọc & Ghi Cache](#33-quy-tắc-bất-biến-khi-đọc--ghi-cache)
-4. [Hướng Dẫn Sao Lưu (Backup) & Phục Hồi Dữ Liệu](#4-hướng-dẫn-sao-lưu-backup--phục-hồi-dữ-liệu)
-5. [Cơ Chế Đồng Bộ Ngược Lại Tool Gốc Unity](#5-cơ-chế-đồng-bộ-ngược-lại-tool-gốc-unity)
-6. [Chi Tiết Toàn Bộ Tính Năng Trên Giao Diện Web](#6-chi-tiết-toàn-bộ-tính-năng-trên-giao-diện-web)
-   - [6.1. Không Gian 3D LiDAR & 2D Camera](#61-không-gian-3d-lidar--2d-camera)
-   - [6.2. 3 Khung Chiếu Trực Giao Cắt Lớp (Sub-Views)](#62-3-khung-chiếu-trực-giao-cắt-lớp-sub-views)
-   - [6.3. Chế Độ 2D Mode (Top-Down Bounding Box Editor)](#63-chế-độ-2d-mode-top-down-bounding-box-editor)
-   - [6.4. Tính Năng Auto Box (Dự Đoán Quỹ Đạo Chuyển Động)](#64-tính-năng-auto-box-dự-đoán-quỹ-đạo-chuyển-động)
-   - [6.5. Tính Năng Google Drive Sync Qua Apps Script](#65-tính-năng-google-drive-sync-qua-apps-script)
-7. [Bảng Phím Tắt Tiêu Chuẩn (Hotkeys)](#7-bảng-phím-tắt-tiêu-chuẩn-hotkeys)
-8. [Hướng Dẫn Cài Đặt & Khởi Động](#8-hướng-dẫn-cài-đặt--khởi-động)
-9. [Lưu Ý Sống Còn Dành Cho AI Kế Thừa (Developer Notes)](#9-lưu-ý-sống-còn-dành-cho-ai-kế-thừa-developer-notes)
+Comprehensive technical documentation covering system architecture, cache management, data backup pipelines, bidirectional synchronization, and developer guidelines for the 3D LiDAR Web Annotation Suite.
 
 ---
 
-## 1. Tổng Quan Hệ Thống
-
-Dự án này là bộ công cụ gán nhãn dữ liệu xe tự hành (Autonomous Driving Object Detection - ADO 3D) kết hợp giữa:
-1. **Tool Gốc Unity (`ADO-anntoation-tool`)**: Ứng dụng chạy trên nền Unity của hãng  Inc, dùng để load chuỗi dữ liệu (Sequence) từ server công ty về máy cục bộ.
-2. **Tool Web Nội Bộ (`Web Annotation Tool`)**: Ứng dụng web chạy trên nền Python Flask (`localhost:5000`) và Three.js / Canvas HTML5. Công cụ này được xây dựng để khắc phục các hạn chế của Unity (nhanh hơn, nhẹ hơn, có tính năng Auto Box nội suy quỹ đạo, chỉnh sửa 2D/3D đồng thời, và sao lưu dữ liệu lên Google Drive).
-3. **Công cụ Kiểm Tra Nhanh (`FastCheck App`)**: Ứng dụng phụ chạy tại `localhost:5050` dùng để review nhanh dữ liệu 10 frame cùng lúc ở chế độ Read-Only.
+## 📑 Table of Contents
+1. [System Overview](#1-system-overview)
+2. [Directory Structure](#2-directory-structure)
+3. [Cache Architecture & Data Integrity](#3-cache-architecture--data-integrity)
+   - [3.1. External Host Client Cache](#31-external-host-client-cache)
+   - [3.2. Local Web Tool Cache](#32-local-web-tool-cache)
+   - [3.3. Invariant Read & Write Rules](#33-invariant-read--write-rules)
+4. [Backup & Cloud Synchronization](#4-backup--cloud-synchronization)
+5. [Bidirectional Host Synchronization](#5-bidirectional-host-synchronization)
+6. [Core Web Interface Features](#6-core-web-interface-features)
+   - [6.1. 3D LiDAR Viewport & 2D Camera Projection](#61-3d-lidar-viewport--2d-camera-projection)
+   - [6.2. Orthogonal Cross-Section Sub-Views](#62-orthogonal-cross-section-sub-views)
+   - [6.3. 2D Top-Down Bounding Box Editor](#63-2d-top-down-bounding-box-editor)
+   - [6.4. Kinematic Auto-Box Trajectory Interpolation](#64-kinematic-auto-box-trajectory-interpolation)
+   - [6.5. Serverless Cloud Sync via Google Apps Script](#65-serverless-cloud-sync-via-google-apps-script)
+7. [Standard Keyboard Shortcuts (Hotkeys)](#7-standard-keyboard-shortcuts-hotkeys)
+8. [Installation & Quick Start](#8-installation--quick-start)
+9. [Developer & AI Maintainer Guidelines](#9-developer--ai-maintainer-guidelines)
 
 ---
 
-## 2. Cấu Trúc Thư Mục & Các Tệp Tin Quan Trọng
+## 1. System Overview
+
+This project is a high-throughput 3D spatial annotation suite designed for Autonomous Driving Object Detection (3D-OD) datasets. It bridges a desktop sequence loader with a lightweight, hardware-accelerated web workspace:
+
+1. **External Host Client**: Desktop client responsible for fetching raw multi-frame sensor sequences from remote storage into local disk cache.
+2. **Web Annotation Workspace (`localhost:5000`)**: A lightweight web application powered by Python Flask, Three.js (WebGL), and HTML5 Canvas. Built to eliminate heavy engine overhead, it features real-time 3D-to-2D bounding box projection, orthogonal cross-section slicing, kinematic trajectory interpolation (Auto-Box), and serverless cloud backup.
+3. **FastCheck QA Viewer (`localhost:5050`)**: A standalone read-only Flask server designed for rapid multi-frame (10-frame) quality assurance and spatial consistency inspection.
+
+---
+
+## 2. Directory Structure
 
 ```text
-H:\a\
-├── install.bat                     # Script tự động cài thư viện Python (flask, numpy, requests)
-├── start_web_tool.bat              # Script khởi động cùng lúc Web Tool (5000) & FastCheck (5050)
-├── fast_check_app.py               # Standalone Flask server phục vụ FastCheck 3D Viewer (5050)
-├── cache/                          # THƯ MỤC CHÍNH CHỨA CACHE WEB TOOL
-│   ├── annotations/                # Chứa frame_0001.json -> frame_0010.json
-│   ├── images/                     # Chứa frame_0001.png -> frame_0010.png
-│   ├── pcd/                        # Chứa frame_0001.pcd -> frame_0010.pcd
-│   └── calibration.json            # Ma trận hiệu chuẩn LiDAR - Camera - Xe
-├── web_app/
-│   ├── server.py                   # Backend Flask chính (API nạp, lưu, convert, auto-box, drive)
-│   ├── auto_box.py                 # Module thuật toán vật lý dự đoán quỹ đạo box
-│   ├── drive_sync.py               # Module giao tiếp HTTP gửi/nhận JSON với Google Apps Script
-│   ├── drive_config.json           # File lưu URL Web App Google Apps Script và cấu hình auto-sync
-│   ├── sync_to_unity.py            # Module đồng bộ nhãn từ Web Cache ngược lại Unity Tool
-│   ├── google_apps_script_template.js # Mã nguồn JavaScript để dán vào Google Apps Script
-│   └── static/
-│       ├── index.html              # Giao diện người dùng Web Tool
-│       ├── css/style.css           # Toàn bộ CSS giao diện, floating windows, viewport
-│       └── js/
-│           ├── app.js              # Controller chính xử lý sự kiện, hotkeys, state, API
-│           ├── pointcloud.js       # Quản lý Three.js, LiDAR 3D, cắt trực giao, render Box
-│           ├── projection.js       # Chiếu tọa độ 3D LiDAR sang tọa độ Pixel 2D Camera
-│           ├── OrbitControls.js    # Thư viện điều khiển góc xoay camera 3D
-│           └── three.min.js        # Thư viện đồ họa WebGL Three.js
+<PROJECT_ROOT>/
+├── install.bat                        # Automated Python dependency installer (flask, numpy, requests)
+├── start_web_tool.bat                 # Concurrent launcher for Main Tool (5000) & FastCheck (5050)
+├── fast_check_app.py                  # Standalone Flask server for FastCheck 3D QA Viewer (5050)
+├── cache/                             # PRIMARY LOCAL CACHE DIRECTORY
+│   ├── annotations/                   # Annotated cuboids: frame_0001.json -> frame_0010.json
+│   ├── images/                        # Synchronized camera frames: frame_0001.png -> frame_0010.png
+│   ├── pcd/                           # LiDAR point clouds: frame_0001.pcd -> frame_0010.pcd
+│   └── calibration.json               # Intrinsic/extrinsic LiDAR-to-Camera-to-Vehicle matrices
+└── web_app/
+    ├── server.py                      # Main Flask backend (I/O, coordinate transforms, Auto-Box, sync)
+    ├── auto_box.py                    # Kinematic linear/angular velocity trajectory predictor
+    ├── drive_sync.py                  # HTTP client communicating with Google Apps Script Web App
+    ├── drive_config.json              # Configuration storing Web App endpoint & auto-sync flags
+    ├── sync_to_unity.py               # Bidirectional exporter syncing labels back to host client
+    ├── google_apps_script_template.js # Serverless backend script for Google Drive integration
+    └── static/
+        ├── index.html                 # Main Web UI layout
+        ├── css/style.css              # Styling for viewports and non-blocking floating windows
+        └── js/
+            ├── app.js                 # Core state machine, hotkey bindings, and API controller
+            ├── pointcloud.js          # Three.js WebGL renderer, orthogonal slicing, cuboid gizmos
+            ├── projection.js          # 3D LiDAR-to-2D camera pixel projection math
+            ├── OrbitControls.js       # 3D camera navigation controller
+            └── three.min.js           # Three.js WebGL library
 ```
 
 ---
 
-## 3. Cơ Chế Cache Của Tool Gốc Unity và Web Tool
+## 3. Cache Architecture & Data Integrity
 
-### 3.1. Cache Gốc Unity 
-* **Đường dẫn thư mục**:
-  `C:\Users\Administrator\AppData\LocalLow\...\sequence`
-* **Quy chuẩn 31 File**:
-  Một sequence đầy đủ gồm đúng **31 file**:
-  * 10 file Point Cloud PCD: `0000_MCAM_....pcd` đến `0009_MCAM_....pcd`
-  * 10 file Ảnh Camera PNG: `0000_IMG_Camera1_....png` đến `0009_IMG_Camera1_....png`
-  * 10 file Nhãn Annotations JSON: `0000_MCAM_....json` đến `0009_MCAM_....json`
-  * 1 file Ma trận hiệu chuẩn: `calibration.json`
-* **Quy tắc đếm Index (0-based vs 1-based)**:
-  * Trong Unity, các file bắt đầu từ số **0** (`0000` đến `0009`).
-  * Trong Web Tool, để người dùng không bị nhầm lẫn, giao diện hiển thị từ **Frame 1 đến Frame 10**. Tương ứng:
-    * Frame 1 web $\leftrightarrow$ File `0000` Unity $\leftrightarrow$ File `frame_0001` Web Cache.
-    * Frame 10 web $\leftrightarrow$ File `0009` Unity $\leftrightarrow$ File `frame_0010` Web Cache.
-* **Cơ chế kiểm tra 31 file an toàn**:
-  Khi người dùng bấm nút **🎮 Cache Unity**, server sẽ kiểm tra số lượng file trong thư mục `sequence`.
-  * Nếu $\ge 31$ file: Tự động load ngay không hỏi.
-  * Nếu $< 31$ file: Hiện modal cảnh báo thiếu dữ liệu (`modal-unity-cache-confirm`). Người dùng bấm *Có* mới nạp, bấm *Không* sẽ hủy bỏ.
+### 3.1. External Host Client Cache
+* **Default Path**: `<USER_LOCAL_APPDATA>/<HOST_CLIENT_DIR>/sequence`
+* **31-File Sequence Standard**:
+  A complete 10-frame sequence consists of exactly **31 files**:
+  * 10 Point Cloud files (`.pcd`): `0000_*.pcd` through `0009_*.pcd`
+  * 10 Camera Image files (`.png`): `0000_*.png` through `0009_*.png`
+  * 10 Annotation files (`.json`): `0000_*.json` through `0009_*.json`
+  * 1 Calibration file: `calibration.json`
+* **Index Mapping (0-based vs. 1-based)**:
+  * The host desktop client uses **0-based indexing** (`0000` to `0009`).
+  * The Web Annotation Tool presents **1-based indexing** (**Frame 1 to Frame 10**) for intuitive human labeling:
+    * Web Frame 1 $\leftrightarrow$ Host `0000` $\leftrightarrow$ Web Cache `frame_0001`
+    * Web Frame 10 $\leftrightarrow$ Host `0009` $\leftrightarrow$ Web Cache `frame_0010`
+* **Integrity Verification Guard**:
+  When loading from the host cache, the backend verifies the file count in `sequence`:
+  * If $\ge 31$ files: Loads immediately into memory.
+  * If $< 31$ files: Triggers a confirmation warning modal (`modal-unity-cache-confirm`) to prevent partial sequence corruption.
 
-### 3.2. Cache Web Tool (Local Cache H:\a\cache)
-* **Đường dẫn thư mục**: `H:\a\cache`
-* **Cấu trúc**:
-  * `annotations/frame_0001.json` ... `frame_0010.json`: Chứa các object cuboid đã gán nhãn.
-  * `images/frame_0001.png` ... `frame_0010.png`: Ảnh trích xuất từ camera.
-  * `pcd/frame_0001.pcd` ... `frame_0010.pcd`: Dữ liệu đám mây điểm.
-  * `calibration.json`: Thông số nội tại, ngoại tại camera và ma trận biến đổi LiDAR sang Vehicle.
+### 3.2. Local Web Tool Cache
+* **Directory Path**: `./cache/`
+* Stores normalized frame assets (`annotations/`, `images/`, `pcd/`, and `calibration.json`) decoupled from the external client to prevent accidental overwrites.
 
-### 3.3. Quy Tắc Bất Biến Khi Đọc & Ghi Cache
+### 3.3. Invariant Read & Write Rules
 > [!IMPORTANT]
-> **QUY TẮC SỐNG CÒN**:
-> Khi người dùng bấm **🎮 Cache Unity**, Web Tool **TUYỆT ĐỐI KHÔNG ĐƯỢC GHI ĐÈ** vào `H:\a\cache\annotations\`.
-> Dữ liệu Unity chỉ được đọc vào bộ nhớ RAM của Server để người dùng xem.
+> **CRITICAL DATA SAFETY RULE**:
+> Loading data from the external host cache **MUST NEVER OVERWRITE** `./cache/annotations/`. External sequence data is loaded strictly into server RAM for previewing.
 > 
-> **Cache Web (`H:\a\cache\annotations\`) CHỈ ĐƯỢC PHÉP GHI trong các trường hợp sau**:
-> 1. Người dùng bấm nút **Save** trên thanh công cụ.
-> 2. Người dùng nhấn tổ hợp phím **`Ctrl + S`**.
-> 3. Người dùng chuyển frame bằng nút Next / Prev (hoặc hotkey `A`/`D`, phím mũi tên).
-> 4. Người dùng click trực tiếp vào các nút số frame **1 đến 10**.
+> **Local Web Cache (`./cache/annotations/`) is ONLY written when triggered by explicit user actions**:
+> 1. Clicking the **Save** button on the toolbar.
+> 2. Pressing **`Ctrl + S`**.
+> 3. Navigating between frames via **Next / Prev** buttons (or hotkeys `A` / `D`, Arrow keys).
+> 4. Directly selecting frame indices **1 through 10**.
 
 ---
 
-## 4. Hướng Dẫn Sao Lưu (Backup) & Phục Hồi Dữ Liệu
+## 4. Backup & Cloud Synchronization
 
-### 4.1. Sao Lưu Cache Gốc Unity
-* Khi tool Unity tải xong một sequence mới, copy toàn bộ thư mục:
-  `C:\Users\Administrator\AppData\LocalLow\...\sequence`
-  sang một nơi an toàn hoặc nén thành file `.zip`.
+### 4.1. Local Snapshots
+* **Raw Sequence Backup**: Archive the host `sequence` directory (`.zip`) immediately after downloading a new sequence.
+* **Annotation Work Backup**: Back up `./cache/` periodically to preserve labeled cuboid states.
 
-### 4.2. Sao Lưu Cache Web Cục Bộ
-* Sao chép toàn bộ thư mục `H:\a\cache` sang vị trí lưu trữ khác. Thư mục này chứa toàn bộ công sức bạn đã vẽ box.
-
-### 4.3. Sao Lưu Lên Google Drive Qua Apps Script (Đám Mây)
-Hệ thống đã tích hợp chức năng Cloud Sync thông qua Google Apps Script Web App:
-1. Bấm nút **`☁️ Apps Script`** ở cạnh Front View để mở cửa sổ di động.
-2. Dán link Web App (kết thúc bằng `/exec`) vào ô cấu hình và bấm `🔒 Lưu`.
-3. **Upload lên Drive**:
-   * Bấm **`☁️ Upload All Frame`**: Tải toàn bộ 10 file JSON lên Google Drive.
-   * Bấm **`📤 Upload Frame Này`**: Tải riêng file JSON của frame hiện tại lên Drive.
-   * Tick vào **`Tự động sync Frame`**: Mỗi khi bạn bấm Save hoặc `Ctrl + S`, hệ thống tự động chạy luồng ngầm đẩy file JSON lên Drive mà không gây khựng giao diện.
-   * *Đặc tính an toàn*: Nếu file đã có sẵn trên Drive, hệ thống sẽ **ghi đè nội dung mới**, tuyệt đối không tạo thêm file trùng lặp.
-4. **Download từ Drive về Web Tool**:
-   * Bấm **`📥 Download All Frame`**: Tải toàn bộ JSON từ Drive về ghi đè vào `H:\a\cache\annotations\` và làm mới lại web.
-   * Bấm **`📥 Download Frame Này`**: Tải riêng frame hiện tại về đè vào máy.
+### 4.2. Cloud Synchronization (Google Drive via Apps Script)
+1. Click **`☁️ Apps Script`** next to the Front View viewport to open the non-blocking floating sync panel.
+2. Paste your deployed Google Apps Script Web App URL (ending in `/exec`) and click `🔒 Save`.
+3. **Upload to Cloud**:
+   * **`☁️ Upload All Frame`**: Pushes all 10 annotation JSON files to Google Drive.
+   * **`📤 Upload Current Frame`**: Pushes only the active frame's JSON file.
+   * **`Auto-sync Frame` Toggle**: Automatically triggers a background upload thread whenever `Save` or `Ctrl + S` is executed without blocking the UI.
+   * *Idempotent Overwrite*: Existing files with matching names on Google Drive are updated in-place to prevent duplicate clutter.
+4. **Restore from Cloud**:
+   * **`📥 Download All Frame`** / **`📥 Download Current Frame`**: Pulls remote JSON annotations into `./cache/annotations/` and refreshes the active viewport.
 
 ---
 
-## 5. Cơ Chế Đồng Bộ Ngược Lại Tool Gốc Unity
+## 5. Bidirectional Host Synchronization
 
-Khi bạn đã hoàn thành công việc trên Web Tool và muốn nộp kết quả qua Tool Unity:
-1. Trên giao diện Web Tool, bấm nút **`🔄 Đồng bộ Unity`** trên thanh Header.
-2. Module `sync_to_unity.py` sẽ thực hiện:
-   * Quét toàn bộ `H:\a\cache\annotations\frame_0001.json` đến `frame_0010.json`.
-   * Khớp từng frame tương ứng với file gốc trong thư mục Unity (`0000_MCAM_...json` đến `0009_MCAM_...json`).
-   * Giữ nguyên cấu trúc ma trận camera, tên camera, header của Unity, chỉ thay thế mảng `object_list` với tọa độ, kích thước, yaw chuẩn xác.
-   * Ghi đè vào thư mục `sequence` của Unity Tool.
-3. Mở Tool Unity lên, toàn bộ box đã xuất hiện chuẩn xác 100%.
+Once annotation is completed in the Web Tool, labels can be exported back to the external desktop client format:
+1. Click **`🔄 Sync to Host`** in the top header bar.
+2. `sync_to_unity.py` executes the following pipeline:
+   * Reads `./cache/annotations/frame_0001.json` through `frame_0010.json`.
+   * Maps each frame back to its corresponding 0-based host JSON file (`0000_*.json` – `0009_*.json`).
+   * Preserves original sensor headers, camera names, and calibration matrices while updating the `object_list` array with refined 3D dimensions, coordinates, and yaw angles.
 
 ---
 
-## 6. Chi Tiết Toàn Bộ Tính Năng Trên Giao Diện Web
+## 6. Core Web Interface Features
 
-### 6.1. Không Gian 3D LiDAR & 2D Camera
-* **Khung 3D LiDAR**: Render hàng chục nghìn điểm point cloud bằng WebGL BufferGeometry. Cho phép xoay tự do (OrbitControls), zoom, pan. Có thanh điều chỉnh độ sáng (brightness), tương phản (contrast), đổi tông màu (hue), chỉnh kích thước hạt điểm và lọc độ cao trần $Z$.
-* **Khung 2D Camera**: Chiếu ảnh thực tế từ xe. Toàn bộ Box 3D LiDAR được ma trận nội suy chiếu thành bounding box 3D trên ảnh 2D theo thời gian thực.
-  * Hỗ trợ zoom chuột cuộn, kéo chuột trái để di chuyển ảnh.
-  * Hỗ trợ click trực tiếp vào Box trên ảnh 2D để chọn đối tượng.
-  * Checkbox **`chk-id-check`**: Khi chọn 1 ID, camera 2D tự động zoom và căn giữa màn hình vào đúng đối tượng đó.
+### 6.1. 3D LiDAR Viewport & 2D Camera Projection
+* **3D LiDAR Viewport**: Renders tens of thousands of points via WebGL `BufferGeometry` with smooth `OrbitControls` (rotate, zoom, pan). Includes real-time controls for point brightness, contrast, hue shift, point size, and $Z$-axis ceiling filtering.
+* **2D Camera Viewport**: Projects 3D LiDAR cuboids onto the 2D camera image plane in real time using intrinsic/extrinsic calibration matrices.
+  * Supports scroll-wheel zooming, left-click panning, and direct click-to-select on projected 2D boxes.
+  * **Auto-Focus (`chk-id-check`)**: Automatically centers and zooms the 2D camera viewport onto the currently selected Object ID.
 
-### 6.2. 3 Khung Chiếu Trực Giao Cắt Lớp (Sub-Views)
-Nằm ở góc dưới màn hình, cắt độc lập không gian điểm quanh Box đang chọn:
-* **Top View**: Nhìn từ trên xuống (mặt phẳng $XY$).
-* **Side View**: Nhìn từ bên sườn (mặt phẳng $ZY$).
-* **Front View**: Nhìn từ phía trước/sau (mặt phẳng $XZ$).
-* Cho phép rê chuột vào 4 góc hoặc các cạnh chấm vàng để kéo giãn kích thước (Resize Length, Width, Height) và dời tâm box cực kỳ chuẩn xác đến từng centimet.
+### 6.2. Orthogonal Cross-Section Sub-Views
+Three dedicated orthographic slice viewports isolate point clouds around the selected cuboid for centimeter-level precision:
+* **Top View**: $XY$-plane projection (bird's-eye view).
+* **Side View**: $ZY$-plane projection (profile view).
+* **Front View**: $XZ$-plane projection (front/rear view).
+* Dragging corner or edge handles allows fine-grained adjustment of Length, Width, Height, and centroid translation.
 
-### 6.3. Chế Độ 2D Mode (Top-Down Bounding Box Editor)
-* Nhấn nút **`📐 2D Mode`** trên thanh công cụ.
-* Camera 3D sẽ tự động xoay vuông góc $90^\circ$ từ trên trời nhìn thẳng xuống mặt đất.
-* **Chuột trái**: Bấm và kéo bất kỳ Box nào để di chuyển vị trí mượt mà trên mặt phẳng đất.
-* **Chuột phải**: Dùng để cuộn/pan khung nhìn mà không làm lệch góc chiếu.
+### 6.3. 2D Top-Down Bounding Box Editor
+* Toggled via **`📐 2D Mode`** on the toolbar.
+* Locks the 3D camera at a strict $90^\circ$ nadir (top-down) angle looking perpendicular to the ground plane.
+* **Left-Click + Drag**: Smoothly translates cuboids across the ground plane without unintended $Z$-axis drift.
+* **Right-Click + Drag**: Pans the viewport while maintaining orthographic alignment.
 
-### 6.4. Tính Năng Auto Box (Dự Đoán Quỹ Đạo Chuyển Động)
-* Nút bấm **`⚡ Auto Box`** nằm cạnh Front View, mở ra một cửa sổ di động kéo thả được (`float-window-autobox`).
-* **Nguyên lý hoạt động nghiêm ngặt**:
-  * **Frame 1**: Báo lỗi vì là frame đầu tiên, chưa có dữ liệu quá khứ.
-  * **Frame 2**: Báo lỗi vì chỉ mới có Frame 1. Thuật toán vật lý cần ít nhất **2 frame liên tiếp có box** trước đó để tính vector vận tốc $\vec{v}$.
-  * **Từ Frame 3 trở đi**:
-    * Đang ở Frame 3 $\rightarrow$ đọc Frame 2 và Frame 1.
-    * Đang ở Frame 4 $\rightarrow$ đọc Frame 3 và Frame 2.
-    * Nếu Frame $t-1$ chưa có dữ liệu hoặc không có ID của box cần tính, hệ thống lập tức chặn lại và thông báo:
-      `❌ Không thể Auto Box vì Frame trước (Frame X) chưa có ID: #...`
-  * **Tính toán nội suy**:
+### 6.4. Kinematic Auto-Box Trajectory Interpolation
+* Accessible via **`⚡ Auto Box`** (opens a draggable floating window `float-window-autobox`).
+* **Kinematic Estimation Model**:
+  * **Frame 1 & Frame 2**: Blocked from prediction, as at least **two consecutive historical frames** ($t-2$ and $t-1$) are required to establish a velocity vector.
+  * **Frame $t \ge 3$**: Reads object states from Frame $t-1$ and Frame $t-2$. If the target Object ID is missing in Frame $t-1$, execution halts with an explicit diagnostic alert.
+  * **State Extrapolation**:
     $$\Delta x = x_{t-1} - x_{t-2}, \quad \Delta y = y_{t-1} - y_{t-2}, \quad \Delta z = z_{t-1} - z_{t-2}$$
     $$\Delta\text{yaw} = \text{normalize}(\text{yaw}_{t-1} - \text{yaw}_{t-2})$$
-    Vị trí mới:
+    Predicted pose at frame $t$:
     $$x_t = x_{t-1} + \Delta x, \quad y_t = y_{t-1} + \Delta y, \quad z_t = z_{t-1} + \Delta z$$
     $$\text{yaw}_t = \text{normalize}(\text{yaw}_{t-1} + \Delta\text{yaw})$$
-  * Tự động đồng bộ kích thước (Dài, Rộng, Cao), `category`, `subclass` từ frame trước.
-* **2 Chế độ chạy**:
-  1. **`🎯 Auto Box Đang Chọn`**: Cho phép chọn 1 hoặc nhiều Box mong muốn, chỉ tính toán và dời các Box đó.
-  2. **`🚀 Auto Box Toàn Bộ`**: Tự động duyệt qua tất cả các Box hiện có trong frame để dời vị trí theo quỹ đạo.
+  * Automatically propagates cuboid dimensions (Length, Width, Height), `category`, and `subclass` from Frame $t-1$.
+* **Execution Modes**:
+  1. **`🎯 Selected Boxes`**: Predicts poses exclusively for highlighted cuboids.
+  2. **`🚀 All Boxes`**: Batch-predicts trajectories for every tracked object in the frame.
 
-### 6.5. Tính Năng Google Drive Sync Qua Apps Script
-* Cửa sổ di động kéo thả được (`float-window-appscript`), không có nền tối (backdrop) che màn hình, vừa mở cửa sổ vừa làm việc bình thường.
-* **Khả năng tự động dò tìm thư mục**:
-  Mã nguồn Apps Script sử dụng hàm `DriveApp.getFoldersByName("PED")` quét toàn bộ Google Drive. **Bạn có thể di chuyển thư mục `PED` vào bất kỳ thư mục con nào trên Google Drive**, script vẫn tự động tìm thấy và lưu/tải file bình thường.
+### 6.5. Serverless Cloud Sync via Google Apps Script
+* Uses a non-blocking floating window (`float-window-appscript`) so users can continue inspecting 3D point clouds during network transfers.
+* Dynamically locates the configured target folder on Google Drive via `DriveApp.getFoldersByName(<TARGET_FOLDER>)`, allowing users to organize backup folders anywhere in their Drive hierarchy without breaking sync paths.
 
 ---
 
-## 7. Bảng Phím Tắt Tiêu Chuẩn (Hotkeys)
+## 7. Standard Keyboard Shortcuts (Hotkeys)
 
-| Phím Tắt | Chức Năng | Chi Tiết |
+| Shortcut | Action | Description |
 | :--- | :--- | :--- |
-| **`Ctrl + S`** | Lưu dữ liệu Frame | Lưu vào Cache Web (`H:\a\cache\annotations\`). Tự sync Drive nếu bật. |
-| **`A`** hoặc **`←`** | Frame Trước | Tự động lưu frame hiện tại trước khi lùi frame. |
-| **`D`** hoặc **`→`** | Frame Kế Tiếp | Tự động lưu frame hiện tại trước khi tiến frame. |
-| **`O`** | Isolate Box Đang Chọn | Ẩn toàn bộ các box khác trên ảnh 2D, chỉ giữ lại duy nhất box đang chọn. |
-| **`H`** | Ẩn Toàn Bộ Box | Ẩn sạch tất cả các box trên ảnh 2D để quan sát vật thể rõ nét. |
-| **`Ctrl + C`** | Copy Box | Sao chép thông số các Box đang chọn vào bộ nhớ đệm. |
-| **`Ctrl + V`** | Paste Box | Dán các Box đã copy sang Frame hiện tại. |
-| **`Shift + K`** | Copy Từ Frame Sau | Lấy toàn bộ Box của frame kế tiếp dán vào frame này. |
-| **`Del` / `Backspace`** | Xóa Box | Xóa các Cuboid đang được chọn trong frame. |
-| **`Ctrl + Z`** | Hoàn Tác (Undo) | Quay lại thao tác chỉnh sửa hoặc xóa box trước đó. |
-| **`M`** | Đồng Bộ ID Toàn Sequence | Đồng bộ kích thước (Dài, Rộng, Cao) và Class/Subclass của ID này cho toàn bộ 10 Frame. |
+| **`Ctrl + S`** | Save Frame | Writes current annotations to `./cache/annotations/` (and triggers Drive sync if enabled). |
+| **`A`** or **`←`** | Previous Frame | Auto-saves current frame and steps backward ($t - 1$). |
+| **`D`** or **`→`** | Next Frame | Auto-saves current frame and steps forward ($t + 1$). |
+| **`O`** | Isolate Selected Box | Hides all unselected boxes on the 2D camera overlay to inspect occlusion. |
+| **`H`** | Hide All Boxes | Toggles visibility of all 2D/3D bounding boxes for unobstructed visual inspection. |
+| **`Ctrl + C`** | Copy Boxes | Copies selected cuboid parameters to internal clipboard. |
+| **`Ctrl + V`** | Paste Boxes | Pastes copied cuboids into the active frame. |
+| **`Shift + K`** | Pull from Next Frame | Copies all cuboids from Frame $t+1$ into the current frame. |
+| **`Del` / `Backspace`** | Delete Boxes | Removes all currently selected cuboids from the active frame. |
+| **`Ctrl + Z`** | Undo | Reverts the last cuboid translation, resize, or deletion operation. |
+| **`M`** | Propagate ID Attributes | Synchronizes dimensions (L, W, H) and Class/Subclass of the selected ID across all 10 frames. |
 
 ---
 
-## 8. Hướng Dẫn Cài Đặt & Khởi Động
+## 8. Installation & Quick Start
 
-### Cách 1: Khởi động bằng file thực thi EXE (Khuyên dùng - Nhanh nhất)
-Nhấp đúp chuột trực tiếp vào file:
+### Option 1: Standalone Executable (Recommended)
+Run the pre-packaged executable directly from `<PROJECT_ROOT>/`:
 ```text
-H:\a\ADO_Web_Tool.exe
+ADO_Web_Tool.exe
 ```
-* File `.exe` độc lập đã tích hợp sẵn toàn bộ môi trường và dữ liệu giao diện tĩnh.
-* Tự động khởi chạy song song cả 2 Server (Main Tool `5000` & FastCheck `5050`) và tự động mở trình duyệt!
+* Bundles the Python runtime, dependencies, and static frontend assets.
+* Automatically launches both the Main Annotation Server (`5000`) and FastCheck QA Server (`5050`), opening the workspace in your default browser.
 
-### Cách 2: Khởi động bằng Script Batch
-1. Chạy `H:\a\install.bat` để cài thư viện Python (chỉ làm lần đầu).
-2. Nhấp đúp chuột vào `H:\a\start_web_tool.bat` để khởi chạy.
+### Option 2: Running from Source
+1. Run `install.bat` once to install required Python packages (`flask`, `numpy`, `requests`).
+2. Run `start_web_tool.bat` to start both local servers.
 
 ---
 
-## 9. Lưu Ý Sống Còn Dành Cho AI Kế Thừa (Developer Notes)
+## 9. Developer & AI Maintainer Guidelines
 
-Khi được yêu cầu nâng cấp, sửa đổi hoặc mở rộng tính năng cho codebase này, AI cần nắm rõ các nguyên tắc kỹ thuật sau:
+When extending, refactoring, or debugging this codebase, contributors and AI coding assistants must adhere to the following architectural invariants:
 
-1. **Không can thiệp vào cách tổ chức thư mục Cache**:
-   Thư mục `H:\a\cache` là chuẩn định dạng mà cả `server.py` và `fast_check_app.py` cùng đọc. Không tự ý đổi tên thư mục con `annotations`, `images`, `pcd`.
-2. **Luôn bảo toàn nguyên tắc không ghi đè khi Load Unity**:
-   Hàm `scan_original_cache()` trong `server.py` chỉ được phép đọc dữ liệu vào `self.frames[idx]["annotation"]` trên RAM, **không bao giờ** được ghi vào `LOCAL_ANNOTATIONS_DIR`.
-3. **Giữ nguyên quy tắc xoay góc Euler & Quaternion**:
-   Tọa độ LiDAR sử dụng hệ trục phải với thứ tự quay `IZYX` (`orientation: [yaw, pitch, roll]`). Khi chuyển sang Quaternion cần dùng hàm `euler_to_quaternion(roll, pitch, yaw)`.
-4. **Giữ giao diện Non-blocking cho các Floating Windows**:
-   Các cửa sổ chức năng mới (như Auto Box, Drive Sync, YouTube Player, Properties) phải dùng class `.floating-tool-window` và hàm `makeElementDraggable()`, **tuyệt đối không dùng class `.modal` có backdrop đen che màn hình** làm cản trở thao tác 3D/2D của người dùng.
-5. **Đồng bộ hóa 2 chiều Unity**:
-   Khi ghi dữ liệu ngược về Unity trong `sync_to_unity.py`, cấu trúc JSON phải giữ đúng các key gốc của Unity: `pcd_filename`, `img_filenames`, và các key camera bên trong từng object cuboid.
+1. **Preserve Cache Directory Schema**:
+   Both `server.py` and `fast_check_app.py` rely on the exact subdirectory structure under `./cache/` (`annotations/`, `images/`, `pcd/`). Do not rename or restructure these paths.
+2. **Enforce RAM-Only External Loading**:
+   `scan_original_cache()` in `server.py` must only populate `self.frames[idx]["annotation"]` in memory. Never write directly to `LOCAL_ANNOTATIONS_DIR` during an external cache scan.
+3. **Maintain Right-Handed `IZYX` Euler Conventions**:
+   LiDAR orientations follow a right-handed coordinate system with rotation order `IZYX` (`orientation: [yaw, pitch, roll]`). Always use `euler_to_quaternion(roll, pitch, yaw)` when converting to Three.js quaternions.
+4. **Use Non-Blocking Floating Panels**:
+   Any new UI tools (e.g., batch filters, trajectory visualizers) must use `.floating-tool-window` and `makeElementDraggable()`. Avoid full-screen `.modal` backdrops that block 3D viewport interaction.
+5. **Preserve Host JSON Schema on Export**:
+   When writing back to the host client in `sync_to_unity.py`, retain all native metadata keys (`pcd_filename`, `img_filenames`, and per-camera projection attributes) inside each cuboid object.
